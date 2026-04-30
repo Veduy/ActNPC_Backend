@@ -16,7 +16,9 @@
 
 본 MVP의 현재 핵심은 단순 대화형 챗봇이 아니라, **자연어 명령 → 백엔드 command 추출 → Unity command 수신 → NPC 행동 실행**으로 이어지는 end-to-end 행동 루프를 먼저 검증하는 것이다. 이후 확장 단계에서 RAG 검색, MCP Tool 호출, Planner 기반 Action Queue 생성을 붙인다.
 
-기존처럼 명령을 내릴 때마다 현재 씬의 모든 오브젝트 정보를 백엔드로 전달하지 않는다. 또한 백엔드가 OpenAI 응답 후 Unity의 `/npc/act/...` 로컬 HTTP 서버를 다시 호출하지 않는다. 명령 요청의 왕복 경로는 Unity → FastAPI → Unity 응답으로 단순화한다.
+명령의 경로는 Unity → FastAPI → Unity 응답으로 단순화한다.
+
+MCP Tool 호출 구조를 참고하여 fastapi로 구현된 서버에서 ai를 활용해 unity client에서 알맞게 호출될 함수의 규격에 맞는 dict형태의 json을 리턴한다.
 
 ---
 
@@ -24,11 +26,10 @@
 
 ### 2.1 기능 목표
 
-- Unity 2D 환경에서 단일 NPC 에이전트 구현
-- 사용자의 자연어 명령 입력 UI 구현
-- FastAPI 기반 AI 백엔드 구축
-- VectorDB 기반 게임 세계 배경지식 검색 구현
-- MCP Tool 호출 구조를 통한 현재 월드 상태 조회 구현
+- Unity 환경에서 단일 NPC 에이전트 구현
+- 사용자의 자연어 명령 입력을 수행하는 AI NPC
+- FastAPI 기반 백엔드 구축
+- VectorDB 기반 가상 세계 배경지식 검색 구현
 - Planner 기반 Action 순서 생성 구현
 - NPC 이동, 아이템 습득, 복귀 Action 실행 구현
 - 명령 처리 결과를 Unity UI에 텍스트로 출력
@@ -93,9 +94,9 @@
         | 2) HTTP JSON: command 응답
         v
 [Unity 2D Client]
-  - action == move 이면 이동 실행
-  - action == fetch 이면 가져오기 실행
-  - action == null 이면 message 출력
+  - action == move / 이동 실행
+  - action == fetch / 가져오기 실행
+  - action == null / message 출력
 ```
 
 ### 3.2 핵심 변경 사항

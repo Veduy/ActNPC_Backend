@@ -1,4 +1,4 @@
-from fastapi import Body, FastAPI, HTTPException, Query
+﻿from fastapi import Body, FastAPI, HTTPException, Query
 
 import os
 from langchain.chat_models import init_chat_model
@@ -84,6 +84,18 @@ async def command(
         "command": command_data,
     }
 
+@app.post("/command/test")
+async def command_test():
+    return {
+        "status": "ok",
+        "input": "사과로 이동해",
+        "command": {
+            "action": "move",
+            "destination": "apple",
+            "item": None,
+            "message": "사과 위치로 이동할게요.",
+        },
+    }
 
 async def parse_command(message: str) -> dict:
     try:

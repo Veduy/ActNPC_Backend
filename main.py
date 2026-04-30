@@ -4,7 +4,6 @@ import os
 from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
-from mcp_tools import async_call_action_tool, build_act_path
 
 load_dotenv()
 
@@ -61,15 +60,7 @@ def health_check():
 async def openai_health_check(
     message: str = Query(..., min_length=1, description="Natural language input for the connected model"),
 ):
-    try:
-        command = await model.ainvoke(
-            [
-                ("system", SYSTEM_PROMPT),
-                ("human", message),
-            ]
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"OpenAI model invoke failed: {exc}") from exc
+    command = await parse_command(message)
 
     return {
         "status": "ok",
@@ -85,8 +76,18 @@ async def command(
         Body(..., embed=True, min_length=1, description="Natural language command from Unity."),
     ],
 ):
+    command_data = await parse_command(message)
+
+    return {
+        "status": "ok",
+        "input": message,
+        "command": command_data,
+    }
+
+
+async def parse_command(message: str) -> dict:
     try:
-        command_dict = await model.ainvoke(
+        command = await model.ainvoke(
             [
                 ("system", SYSTEM_PROMPT),
                 ("human", message),
@@ -95,17 +96,7 @@ async def command(
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI model invoke failed: {exc}") from exc
 
-    command_data = dict(command_dict)
-    act_path = build_act_path(command_data)
-    unity_result = await async_call_action_tool(command_data)
-
-    return {
-        "status": "ok",
-        "input": message,
-        "command": command_data,
-        "act_path": act_path,
-        "unity_result": unity_result,
-    }
+    return dict(command)
 
 
 def main():

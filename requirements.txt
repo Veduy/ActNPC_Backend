@@ -10,3 +10,4 @@ openai>=1.0.0
 langchain
 langchain-community
 langchain-openai
+psycopg[binary]>=3.2.0

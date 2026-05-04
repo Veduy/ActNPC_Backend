@@ -22,7 +22,7 @@ class CommandStep(TypedDict):
     action: Annotated[
         str | None,
         ...,
-        "Step action. Use move, fetch, or null.",
+        "Step action. Use move, fetch, stop, or null.",
     ]
     target: Annotated[
         str | None,
@@ -42,7 +42,7 @@ class CommandDict(TypedDict):
     action: Annotated[
         str | None,
         ...,
-        "Action to perform. Use move or fetch only when the user clearly asks the NPC to act. Use null for questions, chat, explanations, or information requests.",
+        "Action to perform. Use move, fetch, stop, or null. Use stop when the user asks the NPC to stop, cancel, halt, or freeze current actions.",
     ]
     destination: Annotated[
         str | None,
@@ -74,7 +74,7 @@ You convert a user's natural language input into an NPC command.
 Always translate the user's input and all command field values into English, regardless of the input language.
 
 Rules:
-- action must be one of: move, fetch, null.
+- action must be one of: move, fetch, stop, null.
 - For movement commands, destination must be the target object or place name only.
 - Do not include generic words like "location", "place", "position", "area", "near", "around", or "spot" in destination unless they are part of an actual proper noun.
 - If the user says "the location of X", "X location", "near X", or "go to X's position", set destination to X only.
@@ -82,9 +82,11 @@ Rules:
 - Example: "go to the apple location" -> action="move", destination="apple", item=null, object=null, message="I will move to the apple."
 - Use object=null until Unity returns a concrete Unity object_id.
 - Break compound commands into ordered steps. Include every requested action, even if there are more than two actions.
-- For each step, set action to move, fetch, or null, target to the target object/place name only, and object=null.
+- For each step, set action to move, fetch, stop, or null, target to the target object/place name only, and object=null.
+- If the user says "멈춰", "정지", "그만", "stop", "halt", "cancel", or asks to stop current behavior, set action="stop", steps=[{"action":"stop","target":null,"object":null}].
 - Example: "사과로 이동하고 박스로 이동해" -> steps=[{"action":"move","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="move", destination="apple", item=null, object=null.
 - Example: "사과를 가져오고 박스로 이동해" -> steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="fetch", destination=null, item="apple", object=null.
+- Example: "멈춰" -> action="stop", destination=null, item=null, object=null, steps=[{"action":"stop","target":null,"object":null}], message="Stopping current actions."
 - Return English values for action, destination, object, item, message, and all step fields.
 """.strip()
 
@@ -296,6 +298,11 @@ def build_actions(command_data: dict) -> list[dict]:
         for step in steps:
             action = normalize_action(step.get("action"))
             object_id = step.get("object")
+
+            if action == "stop":
+                actions.append(build_action("STOP", None, len(actions) + 1))
+                continue
+
             if not object_id:
                 continue
 
@@ -314,6 +321,11 @@ def build_actions(command_data: dict) -> list[dict]:
     action = normalize_action(command_data.get("action"))
     object_id = command_data.get("object")
 
+    if action == "stop":
+        return [
+            build_action("STOP", None, 1),
+        ]
+
     if action == "fetch" and object_id:
         return [
             build_action("MOVE_TO", object_id, 1),
@@ -329,11 +341,14 @@ def build_actions(command_data: dict) -> list[dict]:
 
 
 def build_action(command: str, target_id: str, index: int) -> dict:
-    return {
+    action = {
         "action_id": f"act_{index:03d}",
         "command": command,
-        "target_id": target_id,
     }
+    if target_id is not None:
+        action["target_id"] = target_id
+
+    return action
 
 
 async def collect_unity_context_if_needed(websocket: WebSocket, command_data: dict) -> dict | None:
@@ -410,6 +425,15 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
                 "action": action,
                 "target": target,
                 "object": command_data.get("object"),
+            }
+        ]
+
+    if action == "stop":
+        return [
+            {
+                "action": action,
+                "target": None,
+                "object": None,
             }
         ]
 

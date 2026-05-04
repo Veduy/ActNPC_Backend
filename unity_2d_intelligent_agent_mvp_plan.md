@@ -64,11 +64,6 @@
         | 2) WebSocket: client_function_call
         v
 [Unity Client]
-  - GetNearbyObjects()
-  - GetObjectState()
-  - GetNpcState()
-  - GetRequesterState()
-  - CheckReachability()
         |
         | 3) WebSocket: client_function_result
         v

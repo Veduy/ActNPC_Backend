@@ -16,6 +16,26 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 base_model = init_chat_model("gpt-4.1")
 
 
+class CommandStep(TypedDict):
+    """One ordered intent step extracted from the user's command."""
+
+    action: Annotated[
+        str | None,
+        ...,
+        "Step action. Use move, fetch, or null.",
+    ]
+    target: Annotated[
+        str | None,
+        ...,
+        "Target object or place name for this step in English. Use null if the step has no target.",
+    ]
+    object: Annotated[
+        str | None,
+        ...,
+        "Resolved Unity object id for this step. Use null until Unity returns a concrete object_id.",
+    ]
+
+
 class CommandDict(TypedDict):
     """User natural language command converted into a command for one NPC."""
 
@@ -39,6 +59,11 @@ class CommandDict(TypedDict):
         ...,
         "Resolved Unity object id to execute against. Use null until Unity returns a concrete object_id.",
     ]
+    steps: Annotated[
+        list[CommandStep],
+        ...,
+        "Ordered executable intent steps extracted from the user input. Use an empty list for questions or chat.",
+    ]
     message: Annotated[str, ..., "AI response message for the user."]
 
 
@@ -56,7 +81,11 @@ Rules:
 - Example: "사과 위치로 이동해" -> action="move", destination="apple", item=null, object=null, message="I will move to the apple."
 - Example: "go to the apple location" -> action="move", destination="apple", item=null, object=null, message="I will move to the apple."
 - Use object=null until Unity returns a concrete Unity object_id.
-- Return English values for action, destination, object, item, and message.
+- Break compound commands into ordered steps. Include every requested action, even if there are more than two actions.
+- For each step, set action to move, fetch, or null, target to the target object/place name only, and object=null.
+- Example: "사과로 이동하고 박스로 이동해" -> steps=[{"action":"move","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="move", destination="apple", item=null, object=null.
+- Example: "사과를 가져오고 박스로 이동해" -> steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="fetch", destination=null, item="apple", object=null.
+- Return English values for action, destination, object, item, message, and all step fields.
 """.strip()
 
 
@@ -157,7 +186,8 @@ async def websocket_agent(websocket: WebSocket):
                 continue
 
             client_context = await collect_unity_context_if_needed(websocket, command_data)
-            apply_first_object_id(command_data, client_context)
+            apply_resolved_object_ids(command_data, client_context)
+            command_data["actions"] = build_actions(command_data)
 
             await websocket.send_json(
                 {
@@ -203,25 +233,142 @@ def is_client_function_result(data: dict | None) -> bool:
     return data is not None and data.get("type") == "client_function_result"
 
 
-def apply_first_object_id(command_data: dict, client_context: dict | None) -> None:
+def apply_resolved_object_ids(command_data: dict, client_context: dict | None) -> None:
     if not client_context:
         return
 
-    objects = client_context.get("objects")
-    if not isinstance(objects, list) or not objects:
+    step_contexts = client_context.get("steps")
+    if isinstance(step_contexts, list):
+        steps = ensure_command_steps(command_data)
+        first_object_id = None
+
+        for step_context in step_contexts:
+            if not isinstance(step_context, dict):
+                continue
+
+            step_index = step_context.get("step_index")
+            if not isinstance(step_index, int) or step_index < 0 or step_index >= len(steps):
+                continue
+
+            object_id = extract_first_object_id(step_context.get("context"))
+            if not object_id:
+                continue
+
+            steps[step_index]["object"] = object_id
+            if first_object_id is None:
+                first_object_id = object_id
+
+        command_data["steps"] = steps
+        if first_object_id:
+            command_data["object"] = first_object_id
+
         return
+
+    object_id = extract_first_object_id(client_context)
+    if object_id:
+        command_data["object"] = object_id
+
+
+def extract_first_object_id(context: dict | None) -> str | None:
+    if not context:
+        return None
+
+    objects = context.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return None
 
     first_object = objects[0]
     if not isinstance(first_object, dict):
-        return
+        return None
 
     object_id = first_object.get("object_id")
     if isinstance(object_id, str) and object_id.strip():
-        command_data["object"] = object_id.strip()
+        return object_id.strip()
+
+    return None
+
+
+def build_actions(command_data: dict) -> list[dict]:
+    steps = ensure_command_steps(command_data)
+    if steps:
+        actions = []
+
+        for step in steps:
+            action = normalize_action(step.get("action"))
+            object_id = step.get("object")
+            if not object_id:
+                continue
+
+            if action == "fetch":
+                actions.extend(
+                    [
+                        build_action("MOVE_TO", object_id, len(actions) + 1),
+                        build_action("GET_ITEM", object_id, len(actions) + 2),
+                    ]
+                )
+            elif action == "move":
+                actions.append(build_action("MOVE_TO", object_id, len(actions) + 1))
+
+        return actions
+
+    action = normalize_action(command_data.get("action"))
+    object_id = command_data.get("object")
+
+    if action == "fetch" and object_id:
+        return [
+            build_action("MOVE_TO", object_id, 1),
+            build_action("GET_ITEM", object_id, 2),
+        ]
+
+    if action == "move" and object_id:
+        return [
+            build_action("MOVE_TO", object_id, 1),
+        ]
+
+    return []
+
+
+def build_action(command: str, target_id: str, index: int) -> dict:
+    return {
+        "action_id": f"act_{index:03d}",
+        "command": command,
+        "target_id": target_id,
+    }
 
 
 async def collect_unity_context_if_needed(websocket: WebSocket, command_data: dict) -> dict | None:
-    action = command_data.get("action")
+    steps = ensure_command_steps(command_data)
+    if steps:
+        step_contexts = []
+
+        for step_index, step in enumerate(steps):
+            action = normalize_action(step.get("action"))
+            target = get_step_target(step)
+            if action not in {"move", "fetch"} or not target:
+                continue
+
+            context = await request_unity_function(
+                websocket=websocket,
+                function_name="find_object",
+                args={
+                    "query": target,
+                    "object_type": "item" if action == "fetch" else "location",
+                    "max_results": 5,
+                },
+            )
+            step_contexts.append(
+                {
+                    "step_index": step_index,
+                    "action": action,
+                    "target": target,
+                    "context": context,
+                }
+            )
+
+        command_data["steps"] = steps
+        return {"steps": step_contexts} if step_contexts else None
+
+    action = normalize_action(command_data.get("action"))
     item = command_data.get("item")
     destination = command_data.get("destination")
 
@@ -246,6 +393,48 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
                 "max_results": 5,
             },
         )
+
+    return None
+
+
+def ensure_command_steps(command_data: dict) -> list[dict]:
+    raw_steps = command_data.get("steps")
+    if isinstance(raw_steps, list) and raw_steps:
+        return [step for step in raw_steps if isinstance(step, dict)]
+
+    action = normalize_action(command_data.get("action"))
+    target = first_non_empty(command_data.get("item"), command_data.get("destination"))
+    if action in {"move", "fetch"} and target:
+        return [
+            {
+                "action": action,
+                "target": target,
+                "object": command_data.get("object"),
+            }
+        ]
+
+    return []
+
+
+def get_step_target(step: dict) -> str | None:
+    return first_non_empty(step.get("target"), step.get("item"), step.get("destination"))
+
+
+def normalize_action(action: object) -> str | None:
+    if not isinstance(action, str):
+        return None
+
+    normalized = action.strip().lower()
+    if normalized in {"", "null", "none", "no_action"}:
+        return None
+
+    return normalized
+
+
+def first_non_empty(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
 
     return None
 

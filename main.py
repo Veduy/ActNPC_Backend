@@ -4,6 +4,7 @@ import os
 import asyncio
 import json
 import uuid
+from pathlib import Path
 from fastapi import WebSocket, WebSocketDisconnect
 from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ load_dotenv()
 # model setting
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 base_model = init_chat_model("gpt-4.1")
+CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
 
 
 class CommandStep(TypedDict):
@@ -22,7 +24,7 @@ class CommandStep(TypedDict):
     action: Annotated[
         str | None,
         ...,
-        "Step action. Use move, fetch, stop, or null.",
+        "Step action. Use an intent_action from the Unity capabilities manifest, or null.",
     ]
     target: Annotated[
         str | None,
@@ -42,7 +44,7 @@ class CommandDict(TypedDict):
     action: Annotated[
         str | None,
         ...,
-        "Action to perform. Use move, fetch, stop, or null. Use stop when the user asks the NPC to stop, cancel, halt, or freeze current actions.",
+        "Action to perform. Use an intent_action from the Unity capabilities manifest, or null.",
     ]
     destination: Annotated[
         str | None,
@@ -69,26 +71,51 @@ class CommandDict(TypedDict):
 
 model = base_model.with_structured_output(CommandDict)
 
-SYSTEM_PROMPT = """
+BASE_SYSTEM_PROMPT = """
 You convert a user's natural language input into an NPC command.
-Always translate the user's input and all command field values into English, regardless of the input language.
+Use the Unity capabilities manifest below as the source of truth for what the NPC can currently execute.
 
 Rules:
-- action must be one of: move, fetch, stop, null.
-- For movement commands, destination must be the target object or place name only.
-- Do not include generic words like "location", "place", "position", "area", "near", "around", or "spot" in destination unless they are part of an actual proper noun.
-- If the user says "the location of X", "X location", "near X", or "go to X's position", set destination to X only.
-- Example: "사과 위치로 이동해" -> action="move", destination="apple", item=null, object=null, message="I will move to the apple."
-- Example: "go to the apple location" -> action="move", destination="apple", item=null, object=null, message="I will move to the apple."
-- Use object=null until Unity returns a concrete Unity object_id.
-- Break compound commands into ordered steps. Include every requested action, even if there are more than two actions.
-- For each step, set action to move, fetch, stop, or null, target to the target object/place name only, and object=null.
-- If the user says "멈춰", "정지", "그만", "stop", "halt", "cancel", or asks to stop current behavior, set action="stop", steps=[{"action":"stop","target":null,"object":null}].
-- Example: "사과로 이동하고 박스로 이동해" -> steps=[{"action":"move","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="move", destination="apple", item=null, object=null.
-- Example: "사과를 가져오고 박스로 이동해" -> steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}], action="fetch", destination=null, item="apple", object=null.
-- Example: "멈춰" -> action="stop", destination=null, item=null, object=null, steps=[{"action":"stop","target":null,"object":null}], message="Stopping current actions."
-- Return English values for action, destination, object, item, message, and all step fields.
+- Return English values for action, destination, item, object, message, and all step fields.
+- Use only intent_action values listed in executable_actions. If the goal cannot be completed with those actions, return no steps and explain that the required Unity capability is not available yet.
+- Break executable compound requests into ordered steps. Include one step per executable user request.
+- Keep step.target concise: use only the object or place name, without generic words such as location, place, position, near, or around.
+- Set object=null until Unity resolves a concrete object_id.
+- Keep legacy top-level fields aligned with the first executable step: move -> destination, item-targeting actions -> item, stop -> action only.
+
+Examples:
+- "사과 위치로 이동해" -> action="move", destination="apple", item=null, object=null, steps=[{"action":"move","target":"apple","object":null}]
+- "사과를 가져오고 박스로 이동해" -> action="fetch", destination=null, item="apple", object=null, steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}]
+- "사과를 주워" -> action="get_item", destination=null, item="apple", object=null, steps=[{"action":"get_item","target":"apple","object":null}]
+- "사다리를 만들어" -> action=null, destination=null, item=null, object=null, steps=[], message explains that Unity does not expose the required capability yet.
 """.strip()
+
+
+def load_unity_capabilities_text() -> str:
+    try:
+        capabilities = json.loads(CAPABILITIES_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return '{"error":"unity_capabilities.json was not found."}'
+    except json.JSONDecodeError as exc:
+        return json.dumps(
+            {
+                "error": "unity_capabilities.json is invalid JSON.",
+                "detail": str(exc),
+            },
+            ensure_ascii=False,
+        )
+
+    return json.dumps(capabilities, ensure_ascii=False, indent=2)
+
+
+def build_system_prompt() -> str:
+    return (
+        f"{BASE_SYSTEM_PROMPT}\n\n"
+        "Unity capabilities manifest:\n"
+        "```json\n"
+        f"{load_unity_capabilities_text()}\n"
+        "```"
+    )
 
 
 app = FastAPI(
@@ -118,6 +145,16 @@ async def openai_health_check(
         "input": message,
         "command": command,
     }
+
+
+@app.get("/unity/capabilities")
+def unity_capabilities():
+    try:
+        return json.loads(CAPABILITIES_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="unity_capabilities.json was not found.") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"unity_capabilities.json is invalid JSON: {exc}") from exc
 
 
 @app.post("/command")
@@ -169,6 +206,9 @@ async def websocket_agent(websocket: WebSocket):
                     }
                 )
                 continue
+            if is_action_result(parsed_message):
+                await handle_action_result(websocket, parsed_message)
+                continue
 
             user_message = raw_message
             try:
@@ -189,7 +229,12 @@ async def websocket_agent(websocket: WebSocket):
 
             client_context = await collect_unity_context_if_needed(websocket, command_data)
             apply_resolved_object_ids(command_data, client_context)
+            command_data["intent_action"] = command_data.get("action")
             command_data["actions"] = build_actions(command_data)
+            command_data["action"] = None
+            command_data["destination"] = None
+            command_data["item"] = None
+            command_data["object"] = None
 
             await websocket.send_json(
                 {
@@ -209,7 +254,7 @@ async def parse_command(message: str) -> dict:
     try:
         command = await model.ainvoke(
             [
-                ("system", SYSTEM_PROMPT),
+                ("system", build_system_prompt()),
                 ("human", message),
             ]
         )
@@ -233,6 +278,55 @@ def parse_json_text(raw_message: str) -> dict | None:
 
 def is_client_function_result(data: dict | None) -> bool:
     return data is not None and data.get("type") == "client_function_result"
+
+
+def is_action_result(data: dict | None) -> bool:
+    return data is not None and data.get("type") == "action_result"
+
+
+async def handle_action_result(websocket: WebSocket, action_result: dict) -> None:
+    if action_result.get("status") != "failed":
+        return
+
+    command_data = await replan_after_action_failure(action_result)
+    client_context = await collect_unity_context_if_needed(websocket, command_data)
+    apply_resolved_object_ids(command_data, client_context)
+    command_data["intent_action"] = command_data.get("action")
+    command_data["actions"] = build_actions(command_data)
+    command_data["action"] = None
+    command_data["destination"] = None
+    command_data["item"] = None
+    command_data["object"] = None
+
+    await websocket.send_json(
+        {
+            "type": "final_command",
+            "status": "ok",
+            "input": "action_result",
+            "command": command_data,
+            "client_context": client_context,
+            "replanned_from": action_result,
+        }
+    )
+
+
+async def replan_after_action_failure(action_result: dict) -> dict:
+    failed_action = action_result.get("action") if isinstance(action_result.get("action"), dict) else {}
+    failure_prompt = f"""
+Unity failed while executing an NPC action.
+
+Failed action:
+{json.dumps(failed_action, ensure_ascii=False)}
+
+Failure reason:
+{action_result.get("message")}
+
+Use the Unity capabilities manifest to make a new executable recovery plan.
+If GET_ITEM failed because the target is not within pickup range, the NPC should usually move to that target first and then get the item.
+Return only actions that should be attempted after this failure.
+""".strip()
+
+    return await parse_command(failure_prompt)
 
 
 def apply_resolved_object_ids(command_data: dict, client_context: dict | None) -> None:
@@ -313,6 +407,8 @@ def build_actions(command_data: dict) -> list[dict]:
                         build_action("GET_ITEM", object_id, len(actions) + 2),
                     ]
                 )
+            elif action == "get_item":
+                actions.append(build_action("GET_ITEM", object_id, len(actions) + 1))
             elif action == "move":
                 actions.append(build_action("MOVE_TO", object_id, len(actions) + 1))
 
@@ -330,6 +426,11 @@ def build_actions(command_data: dict) -> list[dict]:
         return [
             build_action("MOVE_TO", object_id, 1),
             build_action("GET_ITEM", object_id, 2),
+        ]
+
+    if action == "get_item" and object_id:
+        return [
+            build_action("GET_ITEM", object_id, 1),
         ]
 
     if action == "move" and object_id:
@@ -359,7 +460,7 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
         for step_index, step in enumerate(steps):
             action = normalize_action(step.get("action"))
             target = get_step_target(step)
-            if action not in {"move", "fetch"} or not target:
+            if action not in {"move", "fetch", "get_item"} or not target:
                 continue
 
             context = await request_unity_function(
@@ -367,10 +468,11 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
                 function_name="find_object",
                 args={
                     "query": target,
-                    "object_type": "item" if action == "fetch" else "location",
+                    "object_type": "location" if action == "move" else "item",
                     "max_results": 5,
                 },
             )
+
             step_contexts.append(
                 {
                     "step_index": step_index,
@@ -387,7 +489,7 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
     item = command_data.get("item")
     destination = command_data.get("destination")
 
-    if action == "fetch" and item:
+    if action in {"fetch", "get_item"} and item:
         return await request_unity_function(
             websocket=websocket,
             function_name="find_object",
@@ -419,7 +521,7 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
 
     action = normalize_action(command_data.get("action"))
     target = first_non_empty(command_data.get("item"), command_data.get("destination"))
-    if action in {"move", "fetch"} and target:
+    if action in {"move", "fetch", "get_item"} and target:
         return [
             {
                 "action": action,

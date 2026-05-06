@@ -3,8 +3,10 @@
 import os
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
+from string import Template
 from fastapi import WebSocket, WebSocketDisconnect
 from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
@@ -14,7 +16,17 @@ load_dotenv()
 
 # model setting
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-base_model = init_chat_model("gpt-4.1")
+MODEL_NAME = "gpt-4o-mini"
+MODEL_PRICING_PER_1M_TOKENS = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4.1": {"input": 2.00, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
+}
+base_model = init_chat_model(MODEL_NAME)
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+COMMAND_PARSER_PROMPT_PATH = PROMPTS_DIR / "command_parser_system.md"
+COMMAND_NORMALIZER_PROMPT_PATH = PROMPTS_DIR / "command_normalizer.md"
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
 OBJECT_DATABASE_PATH = Path(__file__).with_name("object_database.json")
 
@@ -70,30 +82,13 @@ class CommandDict(TypedDict):
     message: Annotated[str, ..., "AI response message for the user."]
 
 
-model = base_model.with_structured_output(CommandDict)
+model = base_model.with_structured_output(CommandDict, include_raw=True)
 
-BASE_SYSTEM_PROMPT = """
-You convert a user's natural language input into an NPC command.
-Use the Unity capabilities manifest below as the source of truth for what the NPC can currently execute.
-
-Rules:
-- Return English values for action, destination, item, object, message, and all step fields.
-- Use only intent_action values listed in executable_actions for physical NPC actions.
-- General conversation, greetings, questions, and small talk do not require a Unity executable action. For those, return action=null, destination=null, item=null, object=null, steps=[], and answer naturally in message.
-- If the user asks for a physical world action that cannot be completed with executable_actions, return no steps and explain that the required Unity capability is not available yet.
-- Break executable compound requests into ordered steps. Include one step per executable user request.
-- Do not reject count/all item requests. Represent them as the requested item action; the final normalization pass will expand them into repeated minimum-unit steps after Unity context is available.
-- Keep step.target concise: use only the object or place name, without generic words such as location, place, position, near, or around.
-- Set object=null until Unity resolves a concrete object_id.
-- Keep legacy top-level fields aligned with the first executable step: move -> destination, item-targeting actions -> item, stop -> action only.
-
-Examples:
-- "사과 위치로 이동해" -> action="move", destination="apple", item=null, object=null, steps=[{"action":"move","target":"apple","object":null}]
-- "사과를 가져오고 박스로 이동해" -> action="fetch", destination=null, item="apple", object=null, steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}]
-- "사과를 주워" -> action="get_item", destination=null, item="apple", object=null, steps=[{"action":"get_item","target":"apple","object":null}]
-- "너랑 평범한 대화가 가능한가?" -> action=null, destination=null, item=null, object=null, steps=[], message answers conversationally.
-- "사다리를 만들어" -> action=null, destination=null, item=null, object=null, steps=[], message explains that Unity does not expose the required capability yet.
-""".strip()
+def load_prompt(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Prompt file was not found: {path.name}") from exc
 
 
 def load_unity_capabilities_text() -> str:
@@ -132,7 +127,7 @@ def load_object_database_text() -> str:
 
 def build_system_prompt() -> str:
     return (
-        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"{load_prompt(COMMAND_PARSER_PROMPT_PATH)}\n\n"
         "Unity capabilities manifest:\n"
         "```json\n"
         f"{load_unity_capabilities_text()}\n"
@@ -282,7 +277,7 @@ async def websocket_agent(websocket: WebSocket):
 
 async def parse_command(message: str) -> dict:
     try:
-        command = await model.ainvoke(
+        result = await model.ainvoke(
             [
                 ("system", build_system_prompt()),
                 ("human", message),
@@ -291,7 +286,7 @@ async def parse_command(message: str) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI model invoke failed: {exc}") from exc
 
-    return dict(command)
+    return extract_structured_command(result, "parse_command")
 
 
 async def normalize_to_minimal_command(
@@ -302,34 +297,13 @@ async def normalize_to_minimal_command(
     steps = ensure_command_steps(command_data)
     if not steps:
         return command_data
+    if not needs_minimal_normalization(user_message, steps):
+        return command_data
 
-    normalization_prompt = f"""
-Rewrite the parsed NPC command into the final minimal executable step list.
-
-Rules:
-- Each step must be one minimum executable unit.
-- For get_item, one step means picking up one item instance.
-- For fetch, one step means one fetch request and will become MOVE_TO + GET_ITEM for one item instance.
-- If the user asks for all/every matching item, repeat get_item/fetch once per matching object in Unity context.
-- If the user asks for a specific count, repeat get_item/fetch min(requested_count, matching_object_count) times.
-- If fewer matching objects exist than requested, only emit steps for the objects that exist.
-- Preserve later user requests in order. For example, "pick up 2 apples then move to tree" becomes get_item, get_item, move.
-- Use object ids from Unity context. object_id is a type id, so repeated item steps may use the same object id.
-- Do not add any field outside the schema.
-- Keep legacy top-level fields aligned with the first final step.
-
-Original user message:
-{user_message}
-
-Parsed command:
-{json.dumps(command_data, ensure_ascii=False)}
-
-Unity context:
-{json.dumps(client_context, ensure_ascii=False)}
-""".strip()
+    normalization_prompt = build_normalization_prompt(user_message, command_data, client_context)
 
     try:
-        normalized_command = await model.ainvoke(
+        result = await model.ainvoke(
             [
                 ("system", build_system_prompt()),
                 ("human", normalization_prompt),
@@ -338,7 +312,131 @@ Unity context:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI command normalization failed: {exc}") from exc
 
-    return dict(normalized_command)
+    return extract_structured_command(result, "normalize_to_minimal_command")
+
+
+def build_normalization_prompt(user_message: str, command_data: dict, client_context: dict | None) -> str:
+    return Template(load_prompt(COMMAND_NORMALIZER_PROMPT_PATH)).safe_substitute(
+        user_message=user_message,
+        command_data_json=json.dumps(command_data, ensure_ascii=False),
+        client_context_json=json.dumps(client_context, ensure_ascii=False),
+    )
+
+
+def needs_minimal_normalization(user_message: str, steps: list[dict]) -> bool:
+    if has_all_items_request(user_message):
+        return True
+
+    countable_steps = sum(1 for step in steps if normalize_action(step.get("action")) in {"fetch", "get_item"})
+    if countable_steps == 0:
+        return False
+
+    requested_count = extract_requested_item_count(user_message)
+    if requested_count is None:
+        return False
+
+    return countable_steps < requested_count
+
+
+def has_all_items_request(message: str) -> bool:
+    normalized = message.strip().lower()
+    if re.search(r"\b(all|every|everything|each)\b", normalized):
+        return True
+
+    return any(keyword in normalized for keyword in ("전부", "모두", "전체", "모든", "있는", "싹"))
+
+
+def extract_requested_item_count(message: str) -> int | None:
+    normalized = message.strip().lower()
+
+    digit_match = re.search(r"\b(\d+)\s*(?:개|번|items?|objects?|apples?|[a-z]+)\b", normalized)
+    if digit_match:
+        return int(digit_match.group(1))
+
+    english_numbers = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+    }
+    for word, count in english_numbers.items():
+        if re.search(rf"\b{word}\b", normalized):
+            return count
+
+    korean_numbers = {
+        "한": 1,
+        "하나": 1,
+        "두": 2,
+        "둘": 2,
+        "세": 3,
+        "셋": 3,
+        "네": 4,
+        "넷": 4,
+        "다섯": 5,
+        "여섯": 6,
+        "일곱": 7,
+        "여덟": 8,
+        "아홉": 9,
+        "열": 10,
+    }
+    for word, count in korean_numbers.items():
+        if re.search(rf"{word}\s*개", normalized):
+            return count
+
+    return None
+
+
+def extract_structured_command(result, operation: str) -> dict:
+    if isinstance(result, dict) and "parsed" in result:
+        parsing_error = result.get("parsing_error")
+        if parsing_error:
+            raise HTTPException(status_code=503, detail=f"{operation} structured output parsing failed: {parsing_error}")
+
+        raw_response = result.get("raw")
+        usage = getattr(raw_response, "usage_metadata", None)
+        if usage:
+            log_model_usage_cost(operation, usage)
+
+        parsed = result.get("parsed")
+    else:
+        parsed = result
+
+    if parsed is None:
+        raise HTTPException(status_code=503, detail=f"{operation} returned no parsed command.")
+
+    return dict(parsed)
+
+
+def log_model_usage_cost(operation: str, usage: dict) -> None:
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+    pricing = MODEL_PRICING_PER_1M_TOKENS.get(MODEL_NAME)
+
+    if pricing is None:
+        print(
+            f"{operation} usage/cost: model={MODEL_NAME}, "
+            f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
+            f"total_tokens={total_tokens}, cost_usd=price_unknown"
+        )
+        return
+
+    input_cost = input_tokens / 1_000_000 * pricing["input"]
+    output_cost = output_tokens / 1_000_000 * pricing["output"]
+    total_cost = input_cost + output_cost
+
+    print(
+        f"{operation} usage/cost: model={MODEL_NAME}, "
+        f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
+        f"total_tokens={total_tokens}, input_cost_usd=${input_cost:.8f}, "
+        f"output_cost_usd=${output_cost:.8f}, total_cost_usd=${total_cost:.8f}"
+    )
 
 
 def parse_json_text(raw_message: str) -> dict | None:

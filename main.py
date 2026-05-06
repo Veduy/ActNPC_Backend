@@ -16,6 +16,7 @@ load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 base_model = init_chat_model("gpt-4.1")
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
+OBJECT_DATABASE_PATH = Path(__file__).with_name("object_database.json")
 
 
 class CommandStep(TypedDict):
@@ -77,8 +78,11 @@ Use the Unity capabilities manifest below as the source of truth for what the NP
 
 Rules:
 - Return English values for action, destination, item, object, message, and all step fields.
-- Use only intent_action values listed in executable_actions. If the goal cannot be completed with those actions, return no steps and explain that the required Unity capability is not available yet.
+- Use only intent_action values listed in executable_actions for physical NPC actions.
+- General conversation, greetings, questions, and small talk do not require a Unity executable action. For those, return action=null, destination=null, item=null, object=null, steps=[], and answer naturally in message.
+- If the user asks for a physical world action that cannot be completed with executable_actions, return no steps and explain that the required Unity capability is not available yet.
 - Break executable compound requests into ordered steps. Include one step per executable user request.
+- Do not reject count/all item requests. Represent them as the requested item action; the final normalization pass will expand them into repeated minimum-unit steps after Unity context is available.
 - Keep step.target concise: use only the object or place name, without generic words such as location, place, position, near, or around.
 - Set object=null until Unity resolves a concrete object_id.
 - Keep legacy top-level fields aligned with the first executable step: move -> destination, item-targeting actions -> item, stop -> action only.
@@ -87,6 +91,7 @@ Examples:
 - "사과 위치로 이동해" -> action="move", destination="apple", item=null, object=null, steps=[{"action":"move","target":"apple","object":null}]
 - "사과를 가져오고 박스로 이동해" -> action="fetch", destination=null, item="apple", object=null, steps=[{"action":"fetch","target":"apple","object":null},{"action":"move","target":"box","object":null}]
 - "사과를 주워" -> action="get_item", destination=null, item="apple", object=null, steps=[{"action":"get_item","target":"apple","object":null}]
+- "너랑 평범한 대화가 가능한가?" -> action=null, destination=null, item=null, object=null, steps=[], message answers conversationally.
 - "사다리를 만들어" -> action=null, destination=null, item=null, object=null, steps=[], message explains that Unity does not expose the required capability yet.
 """.strip()
 
@@ -108,12 +113,33 @@ def load_unity_capabilities_text() -> str:
     return json.dumps(capabilities, ensure_ascii=False, indent=2)
 
 
+def load_object_database_text() -> str:
+    try:
+        object_database = json.loads(OBJECT_DATABASE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return '{"error":"object_database.json was not found."}'
+    except json.JSONDecodeError as exc:
+        return json.dumps(
+            {
+                "error": "object_database.json is invalid JSON.",
+                "detail": str(exc),
+            },
+            ensure_ascii=False,
+        )
+
+    return json.dumps(object_database, ensure_ascii=False, indent=2)
+
+
 def build_system_prompt() -> str:
     return (
         f"{BASE_SYSTEM_PROMPT}\n\n"
         "Unity capabilities manifest:\n"
         "```json\n"
         f"{load_unity_capabilities_text()}\n"
+        "```\n\n"
+        "Object database. Use these object_id values for known targets. Unity treats object_id as an object type id; multiple scene instances may share one object_id, and Unity will choose the nearest matching scene instance at execution time:\n"
+        "```json\n"
+        f"{load_object_database_text()}\n"
         "```"
     )
 
@@ -229,6 +255,10 @@ async def websocket_agent(websocket: WebSocket):
 
             client_context = await collect_unity_context_if_needed(websocket, command_data)
             apply_resolved_object_ids(command_data, client_context)
+            command_data = await normalize_to_minimal_command(user_message, command_data, client_context)
+            if steps_need_object_resolution(command_data):
+                normalized_context = await collect_unity_context_if_needed(websocket, command_data)
+                apply_resolved_object_ids(command_data, normalized_context)
             command_data["intent_action"] = command_data.get("action")
             command_data["actions"] = build_actions(command_data)
             command_data["action"] = None
@@ -262,6 +292,53 @@ async def parse_command(message: str) -> dict:
         raise HTTPException(status_code=503, detail=f"OpenAI model invoke failed: {exc}") from exc
 
     return dict(command)
+
+
+async def normalize_to_minimal_command(
+    user_message: str,
+    command_data: dict,
+    client_context: dict | None,
+) -> dict:
+    steps = ensure_command_steps(command_data)
+    if not steps:
+        return command_data
+
+    normalization_prompt = f"""
+Rewrite the parsed NPC command into the final minimal executable step list.
+
+Rules:
+- Each step must be one minimum executable unit.
+- For get_item, one step means picking up one item instance.
+- For fetch, one step means one fetch request and will become MOVE_TO + GET_ITEM for one item instance.
+- If the user asks for all/every matching item, repeat get_item/fetch once per matching object in Unity context.
+- If the user asks for a specific count, repeat get_item/fetch min(requested_count, matching_object_count) times.
+- If fewer matching objects exist than requested, only emit steps for the objects that exist.
+- Preserve later user requests in order. For example, "pick up 2 apples then move to tree" becomes get_item, get_item, move.
+- Use object ids from Unity context. object_id is a type id, so repeated item steps may use the same object id.
+- Do not add any field outside the schema.
+- Keep legacy top-level fields aligned with the first final step.
+
+Original user message:
+{user_message}
+
+Parsed command:
+{json.dumps(command_data, ensure_ascii=False)}
+
+Unity context:
+{json.dumps(client_context, ensure_ascii=False)}
+""".strip()
+
+    try:
+        normalized_command = await model.ainvoke(
+            [
+                ("system", build_system_prompt()),
+                ("human", normalization_prompt),
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OpenAI command normalization failed: {exc}") from exc
+
+    return dict(normalized_command)
 
 
 def parse_json_text(raw_message: str) -> dict | None:
@@ -380,6 +457,8 @@ def extract_first_object_id(context: dict | None) -> str | None:
     object_id = first_object.get("object_id")
     if isinstance(object_id, str) and object_id.strip():
         return object_id.strip()
+    if isinstance(object_id, int):
+        return str(object_id)
 
     return None
 
@@ -469,7 +548,7 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
                 args={
                     "query": target,
                     "object_type": "location" if action == "move" else "item",
-                    "max_results": 5,
+                    "max_results": 100 if action in {"fetch", "get_item"} else 5,
                 },
             )
 
@@ -540,6 +619,15 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
         ]
 
     return []
+
+
+def steps_need_object_resolution(command_data: dict) -> bool:
+    for step in ensure_command_steps(command_data):
+        action = normalize_action(step.get("action"))
+        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not step.get("object"):
+            return True
+
+    return False
 
 
 def get_step_target(step: dict) -> str | None:

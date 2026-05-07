@@ -7,7 +7,7 @@ Rules:
 - If the user asks for all/every matching item, repeat get_item/fetch once per matching object in Unity context.
 - If the user asks for a specific count, repeat get_item/fetch min(requested_count, matching_object_count) times.
 - If fewer matching objects exist than requested, only emit steps for the objects that exist.
-- Preserve later user requests in order. For example, "pick up 2 apples then move to tree" becomes get_item, get_item, move.
+- Preserve later user requests in their original order after expanding counted or all/every item requests.
 - Use object ids from Unity context. object_id is a type id, so repeated item steps may use the same object id.
 - Do not add any field outside the schema.
 - Keep legacy top-level fields aligned with the first final step.

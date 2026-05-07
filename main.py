@@ -7,6 +7,7 @@ import re
 import uuid
 from pathlib import Path
 from string import Template
+from typing import Literal
 from fastapi import WebSocket, WebSocketDisconnect
 from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
@@ -16,7 +17,8 @@ load_dotenv()
 
 # model setting
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-MODEL_NAME = "gpt-4o-mini"
+MODEL_NAME = "gpt-4.1-nano"
+INPUT_ROUTER_MODEL_NAME = "gpt-4.1-nano"
 MODEL_PRICING_PER_1M_TOKENS = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
@@ -24,11 +26,21 @@ MODEL_PRICING_PER_1M_TOKENS = {
     "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
 }
 base_model = init_chat_model(MODEL_NAME)
+input_router_base_model = init_chat_model(INPUT_ROUTER_MODEL_NAME)
 PROMPTS_DIR = Path(__file__).with_name("prompts")
+INPUT_ROUTER_PROMPT_PATH = PROMPTS_DIR / "input_router_system.md"
 COMMAND_PARSER_PROMPT_PATH = PROMPTS_DIR / "command_parser_system.md"
 COMMAND_NORMALIZER_PROMPT_PATH = PROMPTS_DIR / "command_normalizer.md"
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
 OBJECT_DATABASE_PATH = Path(__file__).with_name("object_database.json")
+
+
+class Vector3Dict(TypedDict):
+    """3D world position."""
+
+    x: Annotated[float, ..., "World x coordinate."]
+    y: Annotated[float, ..., "World y coordinate."]
+    z: Annotated[float, ..., "World z coordinate."]
 
 
 class CommandStep(TypedDict):
@@ -42,12 +54,32 @@ class CommandStep(TypedDict):
     target: Annotated[
         str | None,
         ...,
-        "Target object or place name for this step in English. Use null if the step has no target.",
+        "Legacy target object or place name. Prefer object_name for new outputs.",
     ]
     object: Annotated[
         str | None,
         ...,
-        "Resolved Unity object id for this step. Use null until Unity returns a concrete object_id.",
+        "Legacy resolved Unity object id. Prefer object_id for new outputs.",
+    ]
+    object_name: Annotated[
+        str | None,
+        ...,
+        "Target object or place name in English. Use null if the step has no named target.",
+    ]
+    object_id: Annotated[
+        str | None,
+        ...,
+        "Resolved Unity object id for this step. Use null until Unity resolves a concrete object id.",
+    ]
+    position: Annotated[
+        Vector3Dict | None,
+        ...,
+        "Target world position for coordinate movement. Use null when moving to a named object.",
+    ]
+    count: Annotated[
+        int | None,
+        ...,
+        "Requested item instance count for this step. Use null when the user did not provide a count.",
     ]
 
 
@@ -62,17 +94,32 @@ class CommandDict(TypedDict):
     destination: Annotated[
         str | None,
         ...,
-        "Destination to move to. Use coordinates like (5, 5) or an object location like apple. Use null unless action requires a destination.",
+        "Legacy target destination name. Prefer object_name or position for new outputs.",
     ]
     item: Annotated[
         str | None,
         ...,
-        "Object to fetch or interact with. Use null unless action requires an item.",
+        "Legacy target item name. Prefer object_name for new outputs.",
     ]
     object: Annotated[
         str | None,
         ...,
-        "Resolved Unity object id to execute against. Use null until Unity returns a concrete object_id.",
+        "Legacy resolved Unity object id. Prefer object_id for new outputs.",
+    ]
+    object_name: Annotated[
+        str | None,
+        ...,
+        "Primary target object or place name in English.",
+    ]
+    object_id: Annotated[
+        str | None,
+        ...,
+        "Resolved Unity object id to execute against. Use null until Unity resolves it.",
+    ]
+    position: Annotated[
+        Vector3Dict | None,
+        ...,
+        "Target world position for coordinate movement. Use null for named object targets.",
     ]
     steps: Annotated[
         list[CommandStep],
@@ -82,6 +129,37 @@ class CommandDict(TypedDict):
     message: Annotated[str, ..., "AI response message for the user."]
 
 
+class UserInputRoute(TypedDict):
+    """Single-pass route for user input before loading heavier context."""
+
+    route: Annotated[
+        Literal[
+            "general_dialogue",
+            "capability_question",
+            "immediate_command",
+            "goal_command",
+            "unsupported_or_unknown",
+        ],
+        ...,
+        "Single route for the user input.",
+    ]
+    goal: Annotated[
+        str | None,
+        ...,
+        "Concise English goal when route is goal_command, otherwise null.",
+    ]
+    confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
+    reason: Annotated[str, ..., "Short English reason for the route."]
+
+
+class DialogueResponse(TypedDict):
+    """Non-executable NPC response for conversation input."""
+
+    message: Annotated[str, ..., "Natural Korean response for the user."]
+
+
+input_router_model = input_router_base_model.with_structured_output(UserInputRoute, include_raw=True)
+dialogue_model = input_router_base_model.with_structured_output(DialogueResponse, include_raw=True)
 model = base_model.with_structured_output(CommandDict, include_raw=True)
 
 def load_prompt(path: Path) -> str:
@@ -142,7 +220,7 @@ def build_system_prompt() -> str:
 app = FastAPI(
     title="ActNPC Backend",
     version="0.1.0",
-    description="FastAPI backend for the Unity 2D intelligent NPC agent MVP.",
+    description="FastAPI backend for the Unity intelligent NPC agent."
 )
 
 
@@ -159,11 +237,15 @@ def health_check():
 async def openai_health_check(
     message: str = Query(..., min_length=1, description="Natural language input for the connected model"),
 ):
-    command = await parse_command(message)
+    input_route, route, dialogue_type_route, command_type_route, command = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
+        "input_route": input_route,
+        "intent_route": route,
+        "dialogue_type_route": dialogue_type_route,
+        "command_type_route": command_type_route,
         "command": command,
     }
 
@@ -185,11 +267,15 @@ async def command(
         Body(..., embed=True, min_length=1, description="Natural language command from Unity."),
     ],
 ):
-    command_data = await parse_command(message)
+    input_route, route, dialogue_type_route, command_type_route, command_data = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
+        "input_route": input_route,
+        "intent_route": route,
+        "dialogue_type_route": dialogue_type_route,
+        "command_type_route": command_type_route,
         "command": command_data,
     }
 
@@ -233,7 +319,7 @@ async def websocket_agent(websocket: WebSocket):
 
             user_message = raw_message
             try:
-                command_data = await parse_command(user_message)
+                input_route, route, dialogue_type_route, command_type_route, command_data = await handle_user_input(user_message)
             except HTTPException as exc:
                 await websocket.send_json(
                     {
@@ -244,6 +330,38 @@ async def websocket_agent(websocket: WebSocket):
                             "code": "COMMAND_PARSE_FAILED",
                             "message": exc.detail,
                         },
+                    }
+                )
+                continue
+
+            if route.get("intent") == "conversation":
+                await websocket.send_json(
+                    {
+                        "type": "final_command",
+                        "status": "ok",
+                        "input": user_message,
+                        "input_route": input_route,
+                        "intent_route": route,
+                        "dialogue_type_route": dialogue_type_route,
+                        "command_type_route": command_type_route,
+                        "command": command_data,
+                        "client_context": None,
+                    }
+                )
+                continue
+
+            if command_type_route and command_type_route.get("command_type") != "immediate_command":
+                await websocket.send_json(
+                    {
+                        "type": "final_command",
+                        "status": "ok",
+                        "input": user_message,
+                        "input_route": input_route,
+                        "intent_route": route,
+                        "dialogue_type_route": dialogue_type_route,
+                        "command_type_route": command_type_route,
+                        "command": command_data,
+                        "client_context": None,
                     }
                 )
                 continue
@@ -266,6 +384,10 @@ async def websocket_agent(websocket: WebSocket):
                     "type": "final_command",
                     "status": "ok",
                     "input": user_message,
+                    "input_route": input_route,
+                    "intent_route": route,
+                    "dialogue_type_route": dialogue_type_route,
+                    "command_type_route": command_type_route,
                     "command": command_data,
                     "client_context": client_context,
                 }
@@ -273,6 +395,132 @@ async def websocket_agent(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("Unity client disconnected")
+
+
+async def handle_user_input(message: str) -> tuple[dict, dict, dict | None, dict | None, dict]:
+    input_route = await route_input(message)
+    route = build_legacy_intent_route(input_route)
+    dialogue_type_route = build_legacy_dialogue_type_route(input_route)
+    command_type_route = build_legacy_command_type_route(input_route)
+    selected_route = input_route.get("route")
+
+    if selected_route in {"general_dialogue", "capability_question"}:
+        include_capabilities = selected_route == "capability_question"
+        return input_route, route, dialogue_type_route, None, await build_dialogue_command(
+            message,
+            include_capabilities,
+            selected_route,
+        )
+    if selected_route == "immediate_command":
+        return input_route, route, None, command_type_route, await parse_command(message)
+    if selected_route == "goal_command":
+        return input_route, route, None, command_type_route, build_noop_command("목표형 명령으로 이해했지만, 아직 Planner가 연결되지 않았어요.")
+
+    return input_route, route, None, command_type_route, build_noop_command("명령으로 이해했지만, 아직 실행 가능한 형태로 분류하지 못했어요.")
+
+
+async def route_input(message: str) -> dict:
+    try:
+        result = await input_router_model.ainvoke(
+            [
+                ("system", load_prompt(INPUT_ROUTER_PROMPT_PATH)),
+                ("human", message),
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OpenAI input router invoke failed: {exc}") from exc
+
+    route = extract_structured_output(result, "route_input", INPUT_ROUTER_MODEL_NAME)
+    if route.get("route") not in {
+        "general_dialogue",
+        "capability_question",
+        "immediate_command",
+        "goal_command",
+        "unsupported_or_unknown",
+    }:
+        raise HTTPException(status_code=503, detail=f"route_input returned invalid route: {route.get('route')}")
+
+    return route
+
+
+def build_legacy_intent_route(input_route: dict) -> dict:
+    route = input_route.get("route")
+    intent = "conversation" if route in {"general_dialogue", "capability_question"} else "command"
+    return {
+        "intent": intent,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
+
+
+def build_legacy_dialogue_type_route(input_route: dict) -> dict | None:
+    route = input_route.get("route")
+    if route not in {"general_dialogue", "capability_question"}:
+        return None
+
+    return {
+        "dialogue_type": route,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
+
+
+def build_legacy_command_type_route(input_route: dict) -> dict | None:
+    route = input_route.get("route")
+    if route in {"general_dialogue", "capability_question"}:
+        return None
+
+    return {
+        "command_type": route,
+        "goal": input_route.get("goal") if route == "goal_command" else None,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
+
+
+async def build_dialogue_command(
+    message: str,
+    include_capabilities: bool = False,
+    route_name: str | None = None,
+) -> dict:
+    system_prompt = (
+        "You are a friendly Unity NPC. Answer questions and small talk in Korean. "
+        "Do not claim that you performed any physical action."
+    )
+    if include_capabilities:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "Unity capabilities manifest:\n"
+            "```json\n"
+            f"{load_unity_capabilities_text()}\n"
+            "```\n\n"
+            "If the user asks whether an action is possible, answer based on the manifest."
+        )
+
+    try:
+        result = await dialogue_model.ainvoke(
+            [
+                ("system", system_prompt),
+                ("human", message),
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OpenAI dialogue invoke failed: {exc}") from exc
+
+    operation = f"build_dialogue_command[{route_name}]" if route_name else "build_dialogue_command"
+    response = extract_structured_output(result, operation, INPUT_ROUTER_MODEL_NAME)
+    return build_noop_command(response.get("message"))
+
+
+def build_noop_command(message: object) -> dict:
+    return {
+        "action": None,
+        "destination": None,
+        "item": None,
+        "object": None,
+        "steps": [],
+        "message": message if isinstance(message, str) and message.strip() else "지금은 실행할 명령이 없어요.",
+    }
 
 
 async def parse_command(message: str) -> dict:
@@ -305,7 +553,7 @@ async def normalize_to_minimal_command(
     try:
         result = await model.ainvoke(
             [
-                ("system", build_system_prompt()),
+                ("system", load_prompt(COMMAND_NORMALIZER_PROMPT_PATH)),
                 ("human", normalization_prompt),
             ]
         )
@@ -316,7 +564,14 @@ async def normalize_to_minimal_command(
 
 
 def build_normalization_prompt(user_message: str, command_data: dict, client_context: dict | None) -> str:
-    return Template(load_prompt(COMMAND_NORMALIZER_PROMPT_PATH)).safe_substitute(
+    return Template(
+        "Original:\n"
+        "$user_message\n\n"
+        "Parsed:\n"
+        "$command_data_json\n\n"
+        "Unity context:\n"
+        "$client_context_json"
+    ).safe_substitute(
         user_message=user_message,
         command_data_json=json.dumps(command_data, ensure_ascii=False),
         client_context_json=json.dumps(client_context, ensure_ascii=False),
@@ -324,18 +579,7 @@ def build_normalization_prompt(user_message: str, command_data: dict, client_con
 
 
 def needs_minimal_normalization(user_message: str, steps: list[dict]) -> bool:
-    if has_all_items_request(user_message):
-        return True
-
-    countable_steps = sum(1 for step in steps if normalize_action(step.get("action")) in {"fetch", "get_item"})
-    if countable_steps == 0:
-        return False
-
-    requested_count = extract_requested_item_count(user_message)
-    if requested_count is None:
-        return False
-
-    return countable_steps < requested_count
+    return has_all_items_request(user_message)
 
 
 def has_all_items_request(message: str) -> bool:
@@ -346,53 +590,11 @@ def has_all_items_request(message: str) -> bool:
     return any(keyword in normalized for keyword in ("전부", "모두", "전체", "모든", "있는", "싹"))
 
 
-def extract_requested_item_count(message: str) -> int | None:
-    normalized = message.strip().lower()
-
-    digit_match = re.search(r"\b(\d+)\s*(?:개|번|items?|objects?|apples?|[a-z]+)\b", normalized)
-    if digit_match:
-        return int(digit_match.group(1))
-
-    english_numbers = {
-        "one": 1,
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "five": 5,
-        "six": 6,
-        "seven": 7,
-        "eight": 8,
-        "nine": 9,
-        "ten": 10,
-    }
-    for word, count in english_numbers.items():
-        if re.search(rf"\b{word}\b", normalized):
-            return count
-
-    korean_numbers = {
-        "한": 1,
-        "하나": 1,
-        "두": 2,
-        "둘": 2,
-        "세": 3,
-        "셋": 3,
-        "네": 4,
-        "넷": 4,
-        "다섯": 5,
-        "여섯": 6,
-        "일곱": 7,
-        "여덟": 8,
-        "아홉": 9,
-        "열": 10,
-    }
-    for word, count in korean_numbers.items():
-        if re.search(rf"{word}\s*개", normalized):
-            return count
-
-    return None
-
-
 def extract_structured_command(result, operation: str) -> dict:
+    return extract_structured_output(result, operation, MODEL_NAME)
+
+
+def extract_structured_output(result, operation: str, model_name: str) -> dict:
     if isinstance(result, dict) and "parsed" in result:
         parsing_error = result.get("parsing_error")
         if parsing_error:
@@ -401,7 +603,7 @@ def extract_structured_command(result, operation: str) -> dict:
         raw_response = result.get("raw")
         usage = getattr(raw_response, "usage_metadata", None)
         if usage:
-            log_model_usage_cost(operation, usage)
+            log_model_usage_cost(operation, usage, model_name)
 
         parsed = result.get("parsed")
     else:
@@ -413,15 +615,15 @@ def extract_structured_command(result, operation: str) -> dict:
     return dict(parsed)
 
 
-def log_model_usage_cost(operation: str, usage: dict) -> None:
+def log_model_usage_cost(operation: str, usage: dict, model_name: str) -> None:
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
     total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
-    pricing = MODEL_PRICING_PER_1M_TOKENS.get(MODEL_NAME)
+    pricing = MODEL_PRICING_PER_1M_TOKENS.get(model_name)
 
     if pricing is None:
         print(
-            f"{operation} usage/cost: model={MODEL_NAME}, "
+            f"{operation} usage/cost: model={model_name}, "
             f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
             f"total_tokens={total_tokens}, cost_usd=price_unknown"
         )
@@ -432,7 +634,7 @@ def log_model_usage_cost(operation: str, usage: dict) -> None:
     total_cost = input_cost + output_cost
 
     print(
-        f"{operation} usage/cost: model={MODEL_NAME}, "
+        f"{operation} usage/cost: model={model_name}, "
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
         f"total_tokens={total_tokens}, input_cost_usd=${input_cost:.8f}, "
         f"output_cost_usd=${output_cost:.8f}, total_cost_usd=${total_cost:.8f}"
@@ -521,23 +723,34 @@ def apply_resolved_object_ids(command_data: dict, client_context: dict | None) -
             if not isinstance(step_index, int) or step_index < 0 or step_index >= len(steps):
                 continue
 
-            object_id = extract_first_object_id(step_context.get("context"))
+            object_id = extract_context_target_id(step_context.get("context"), step_context.get("target"))
             if not object_id:
                 continue
 
+            steps[step_index]["object_id"] = object_id
             steps[step_index]["object"] = object_id
             if first_object_id is None:
                 first_object_id = object_id
 
         command_data["steps"] = steps
         if first_object_id:
+            command_data["object_id"] = first_object_id
             command_data["object"] = first_object_id
 
         return
 
-    object_id = extract_first_object_id(client_context)
+    object_id = extract_context_target_id(client_context, get_command_target_name(command_data))
     if object_id:
+        command_data["object_id"] = object_id
         command_data["object"] = object_id
+
+
+def extract_context_target_id(context: dict | None, target: object = None) -> str | None:
+    object_id = extract_first_object_id(context)
+    if object_id:
+        return object_id
+
+    return extract_inventory_item_id(context, target)
 
 
 def extract_first_object_id(context: dict | None) -> str | None:
@@ -561,6 +774,38 @@ def extract_first_object_id(context: dict | None) -> str | None:
     return None
 
 
+def extract_inventory_item_id(context: dict | None, target: object = None) -> str | None:
+    if not context:
+        return None
+
+    inventory = context.get("inventory")
+    if not isinstance(inventory, list) or not inventory:
+        return None
+
+    normalized_target = str(target).strip().lower() if target is not None else ""
+    first_item_id = None
+
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+
+        item_id = item.get("itemId")
+        item_name = item.get("itemName")
+        item_id_text = str(item_id).strip() if item_id is not None else ""
+        if first_item_id is None and item_id_text:
+            first_item_id = item_id_text
+
+        if not normalized_target:
+            continue
+
+        if item_id_text.lower() == normalized_target:
+            return item_id_text
+        if isinstance(item_name, str) and item_name.strip().lower() == normalized_target:
+            return item_id_text
+
+    return first_item_id if not normalized_target else None
+
+
 def build_actions(command_data: dict) -> list[dict]:
     steps = ensure_command_steps(command_data)
     if steps:
@@ -568,11 +813,15 @@ def build_actions(command_data: dict) -> list[dict]:
 
         for step in steps:
             action = normalize_action(step.get("action"))
-            object_id = step.get("object")
+            object_id = get_step_object_id(step)
+            target = get_step_target(step)
 
             if action == "stop":
                 actions.append(build_action("STOP", None, len(actions) + 1))
                 continue
+
+            if action == "put_item" and not object_id:
+                object_id = target
 
             if not object_id:
                 continue
@@ -586,13 +835,18 @@ def build_actions(command_data: dict) -> list[dict]:
                 )
             elif action == "get_item":
                 actions.append(build_action("GET_ITEM", object_id, len(actions) + 1))
+            elif action == "put_item":
+                actions.append(build_action("PUT_ITEM", object_id, len(actions) + 1))
             elif action == "move":
                 actions.append(build_action("MOVE_TO", object_id, len(actions) + 1))
 
         return actions
 
     action = normalize_action(command_data.get("action"))
-    object_id = command_data.get("object")
+    object_id = get_command_object_id(command_data)
+    target = get_command_target_name(command_data)
+    if action == "put_item" and not object_id:
+        object_id = target
 
     if action == "stop":
         return [
@@ -608,6 +862,11 @@ def build_actions(command_data: dict) -> list[dict]:
     if action == "get_item" and object_id:
         return [
             build_action("GET_ITEM", object_id, 1),
+        ]
+
+    if action == "put_item" and object_id:
+        return [
+            build_action("PUT_ITEM", object_id, 1),
         ]
 
     if action == "move" and object_id:
@@ -637,6 +896,8 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
         for step_index, step in enumerate(steps):
             action = normalize_action(step.get("action"))
             target = get_step_target(step)
+            if action == "put_item":
+                continue
             if action not in {"move", "fetch", "get_item"} or not target:
                 continue
 
@@ -663,8 +924,8 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
         return {"steps": step_contexts} if step_contexts else None
 
     action = normalize_action(command_data.get("action"))
-    item = command_data.get("item")
-    destination = command_data.get("destination")
+    item = first_non_empty(command_data.get("object_name"), command_data.get("item"))
+    destination = first_non_empty(command_data.get("object_name"), command_data.get("destination"))
 
     if action in {"fetch", "get_item"} and item:
         return await request_unity_function(
@@ -694,16 +955,20 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
 def ensure_command_steps(command_data: dict) -> list[dict]:
     raw_steps = command_data.get("steps")
     if isinstance(raw_steps, list) and raw_steps:
-        return [step for step in raw_steps if isinstance(step, dict)]
+        return expand_counted_steps([step for step in raw_steps if isinstance(step, dict)])
 
     action = normalize_action(command_data.get("action"))
-    target = first_non_empty(command_data.get("item"), command_data.get("destination"))
-    if action in {"move", "fetch", "get_item"} and target:
+    target = get_command_target_name(command_data)
+    if action in {"move", "fetch", "get_item", "put_item"} and target:
         return [
             {
                 "action": action,
                 "target": target,
-                "object": command_data.get("object"),
+                "object": get_command_object_id(command_data),
+                "object_name": target,
+                "object_id": get_command_object_id(command_data),
+                "position": command_data.get("position"),
+                "count": None,
             }
         ]
 
@@ -713,23 +978,65 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
                 "action": action,
                 "target": None,
                 "object": None,
+                "object_name": None,
+                "object_id": None,
+                "position": None,
+                "count": None,
             }
         ]
 
     return []
 
 
+def expand_counted_steps(steps: list[dict]) -> list[dict]:
+    expanded_steps = []
+
+    for step in steps:
+        action = normalize_action(step.get("action"))
+        repeat_count = get_step_count(step) if action in {"fetch", "get_item", "put_item"} else 1
+
+        for _ in range(repeat_count):
+            expanded_step = dict(step)
+            if repeat_count > 1:
+                expanded_step["count"] = 1
+            expanded_steps.append(expanded_step)
+
+    return expanded_steps
+
+
+def get_step_count(step: dict) -> int:
+    count = step.get("count")
+    if isinstance(count, int) and count > 0:
+        return min(count, 100)
+
+    return 1
+
+
 def steps_need_object_resolution(command_data: dict) -> bool:
     for step in ensure_command_steps(command_data):
         action = normalize_action(step.get("action"))
-        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not step.get("object"):
+        if action == "put_item":
+            continue
+        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not get_step_object_id(step):
             return True
 
     return False
 
 
 def get_step_target(step: dict) -> str | None:
-    return first_non_empty(step.get("target"), step.get("item"), step.get("destination"))
+    return first_non_empty(step.get("object_name"), step.get("target"), step.get("item"), step.get("destination"))
+
+
+def get_step_object_id(step: dict) -> str | None:
+    return first_non_empty(step.get("object_id"), step.get("object"))
+
+
+def get_command_target_name(command_data: dict) -> str | None:
+    return first_non_empty(command_data.get("object_name"), command_data.get("item"), command_data.get("destination"))
+
+
+def get_command_object_id(command_data: dict) -> str | None:
+    return first_non_empty(command_data.get("object_id"), command_data.get("object"))
 
 
 def normalize_action(action: object) -> str | None:

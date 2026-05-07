@@ -9,12 +9,6 @@
     },
     {
       "object_id": 102,
-      "name": "tree",
-      "type": "location",
-      "aliases": ["tree", "\uB098\uBB34"]
-    },
-    {
-      "object_id": 103,
       "name": "box",
       "type": "item",
       "aliases": ["box", "\uBC15\uC2A4", "\uC0C1\uC790"]

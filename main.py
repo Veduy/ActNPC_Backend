@@ -18,9 +18,7 @@ load_dotenv()
 # model setting
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-4.1-nano"
-INTENT_ROUTER_MODEL_NAME = "gpt-4.1-nano"
-DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME = "gpt-4.1-nano"
-COMMAND_TYPE_CLASSIFIER_MODEL_NAME = "gpt-4.1-nano"
+INPUT_ROUTER_MODEL_NAME = "gpt-4.1-nano"
 MODEL_PRICING_PER_1M_TOKENS = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
@@ -28,13 +26,9 @@ MODEL_PRICING_PER_1M_TOKENS = {
     "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
 }
 base_model = init_chat_model(MODEL_NAME)
-intent_router_base_model = init_chat_model(INTENT_ROUTER_MODEL_NAME)
-dialogue_type_classifier_base_model = init_chat_model(DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME)
-command_type_classifier_base_model = init_chat_model(COMMAND_TYPE_CLASSIFIER_MODEL_NAME)
+input_router_base_model = init_chat_model(INPUT_ROUTER_MODEL_NAME)
 PROMPTS_DIR = Path(__file__).with_name("prompts")
-INTENT_ROUTER_PROMPT_PATH = PROMPTS_DIR / "intent_router_system.md"
-DIALOGUE_TYPE_CLASSIFIER_PROMPT_PATH = PROMPTS_DIR / "dialogue_type_classifier_system.md"
-COMMAND_TYPE_CLASSIFIER_PROMPT_PATH = PROMPTS_DIR / "command_type_classifier_system.md"
+INPUT_ROUTER_PROMPT_PATH = PROMPTS_DIR / "input_router_system.md"
 COMMAND_PARSER_PROMPT_PATH = PROMPTS_DIR / "command_parser_system.md"
 COMMAND_NORMALIZER_PROMPT_PATH = PROMPTS_DIR / "command_normalizer.md"
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
@@ -97,13 +91,24 @@ class CommandDict(TypedDict):
     message: Annotated[str, ..., "AI response message for the user."]
 
 
-class IntentRoute(TypedDict):
-    """First-pass route for user input before loading command parsing context."""
+class UserInputRoute(TypedDict):
+    """Single-pass route for user input before loading heavier context."""
 
-    intent: Annotated[
-        Literal["command", "conversation"],
+    route: Annotated[
+        Literal[
+            "general_dialogue",
+            "capability_question",
+            "immediate_command",
+            "goal_command",
+            "unsupported_or_unknown",
+        ],
         ...,
-        "Use command for physical NPC actions in Unity, conversation for questions, greetings, and small talk.",
+        "Single route for the user input.",
+    ]
+    goal: Annotated[
+        str | None,
+        ...,
+        "Concise English goal when route is goal_command, otherwise null.",
     ]
     confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
     reason: Annotated[str, ..., "Short English reason for the route."]
@@ -115,39 +120,8 @@ class DialogueResponse(TypedDict):
     message: Annotated[str, ..., "Natural Korean response for the user."]
 
 
-class DialogueTypeRoute(TypedDict):
-    """Second-pass route for conversation inputs."""
-
-    dialogue_type: Annotated[
-        Literal["general_dialogue", "capability_question"],
-        ...,
-        "Use capability_question only when the user asks what the NPC can do or whether a Unity action is possible.",
-    ]
-    confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
-    reason: Annotated[str, ..., "Short English reason for the dialogue type."]
-
-
-class CommandTypeRoute(TypedDict):
-    """Second-pass route for executable command inputs."""
-
-    command_type: Annotated[
-        Literal["immediate_command", "goal_command", "unsupported_or_unknown"],
-        ...,
-        "Use immediate_command for direct primitive actions, goal_command for planned multi-step goals, unsupported_or_unknown otherwise.",
-    ]
-    goal: Annotated[
-        str | None,
-        ...,
-        "Concise English goal when command_type is goal_command, otherwise null.",
-    ]
-    confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
-    reason: Annotated[str, ..., "Short English reason for the command type."]
-
-
-intent_router_model = intent_router_base_model.with_structured_output(IntentRoute, include_raw=True)
-dialogue_type_classifier_model = dialogue_type_classifier_base_model.with_structured_output(DialogueTypeRoute, include_raw=True)
-command_type_classifier_model = command_type_classifier_base_model.with_structured_output(CommandTypeRoute, include_raw=True)
-dialogue_model = intent_router_base_model.with_structured_output(DialogueResponse, include_raw=True)
+input_router_model = input_router_base_model.with_structured_output(UserInputRoute, include_raw=True)
+dialogue_model = input_router_base_model.with_structured_output(DialogueResponse, include_raw=True)
 model = base_model.with_structured_output(CommandDict, include_raw=True)
 
 def load_prompt(path: Path) -> str:
@@ -225,11 +199,12 @@ def health_check():
 async def openai_health_check(
     message: str = Query(..., min_length=1, description="Natural language input for the connected model"),
 ):
-    route, dialogue_type_route, command_type_route, command = await handle_user_input(message)
+    input_route, route, dialogue_type_route, command_type_route, command = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
+        "input_route": input_route,
         "intent_route": route,
         "dialogue_type_route": dialogue_type_route,
         "command_type_route": command_type_route,
@@ -254,11 +229,12 @@ async def command(
         Body(..., embed=True, min_length=1, description="Natural language command from Unity."),
     ],
 ):
-    route, dialogue_type_route, command_type_route, command_data = await handle_user_input(message)
+    input_route, route, dialogue_type_route, command_type_route, command_data = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
+        "input_route": input_route,
         "intent_route": route,
         "dialogue_type_route": dialogue_type_route,
         "command_type_route": command_type_route,
@@ -305,7 +281,7 @@ async def websocket_agent(websocket: WebSocket):
 
             user_message = raw_message
             try:
-                route, dialogue_type_route, command_type_route, command_data = await handle_user_input(user_message)
+                input_route, route, dialogue_type_route, command_type_route, command_data = await handle_user_input(user_message)
             except HTTPException as exc:
                 await websocket.send_json(
                     {
@@ -326,6 +302,7 @@ async def websocket_agent(websocket: WebSocket):
                         "type": "final_command",
                         "status": "ok",
                         "input": user_message,
+                        "input_route": input_route,
                         "intent_route": route,
                         "dialogue_type_route": dialogue_type_route,
                         "command_type_route": command_type_route,
@@ -341,6 +318,7 @@ async def websocket_agent(websocket: WebSocket):
                         "type": "final_command",
                         "status": "ok",
                         "input": user_message,
+                        "input_route": input_route,
                         "intent_route": route,
                         "dialogue_type_route": dialogue_type_route,
                         "command_type_route": command_type_route,
@@ -368,6 +346,7 @@ async def websocket_agent(websocket: WebSocket):
                     "type": "final_command",
                     "status": "ok",
                     "input": user_message,
+                    "input_route": input_route,
                     "intent_route": route,
                     "dialogue_type_route": dialogue_type_route,
                     "command_type_route": command_type_route,
@@ -380,84 +359,92 @@ async def websocket_agent(websocket: WebSocket):
         print("Unity client disconnected")
 
 
-async def handle_user_input(message: str) -> tuple[dict, dict | None, dict | None, dict]:
-    route = await route_intent(message)
-    if route.get("intent") == "conversation":
-        dialogue_type_route = await classify_dialogue_type(message)
-        include_capabilities = dialogue_type_route.get("dialogue_type") == "capability_question"
-        return route, dialogue_type_route, None, await build_dialogue_command(message, include_capabilities)
+async def handle_user_input(message: str) -> tuple[dict, dict, dict | None, dict | None, dict]:
+    input_route = await route_input(message)
+    route = build_legacy_intent_route(input_route)
+    dialogue_type_route = build_legacy_dialogue_type_route(input_route)
+    command_type_route = build_legacy_command_type_route(input_route)
+    selected_route = input_route.get("route")
 
-    command_type_route = await classify_command_type(message)
-    command_type = command_type_route.get("command_type")
-    if command_type == "immediate_command":
-        return route, None, command_type_route, await parse_command(message)
-    if command_type == "goal_command":
-        return route, None, command_type_route, build_noop_command("목표형 명령으로 이해했지만, 아직 Planner가 연결되지 않았어요.")
+    if selected_route in {"general_dialogue", "capability_question"}:
+        include_capabilities = selected_route == "capability_question"
+        return input_route, route, dialogue_type_route, None, await build_dialogue_command(
+            message,
+            include_capabilities,
+            selected_route,
+        )
+    if selected_route == "immediate_command":
+        return input_route, route, None, command_type_route, await parse_command(message)
+    if selected_route == "goal_command":
+        return input_route, route, None, command_type_route, build_noop_command("목표형 명령으로 이해했지만, 아직 Planner가 연결되지 않았어요.")
 
-    return route, None, command_type_route, build_noop_command("명령으로 이해했지만, 아직 실행 가능한 형태로 분류하지 못했어요.")
+    return input_route, route, None, command_type_route, build_noop_command("명령으로 이해했지만, 아직 실행 가능한 형태로 분류하지 못했어요.")
 
 
-async def route_intent(message: str) -> dict:
+async def route_input(message: str) -> dict:
     try:
-        result = await intent_router_model.ainvoke(
+        result = await input_router_model.ainvoke(
             [
-                ("system", load_prompt(INTENT_ROUTER_PROMPT_PATH)),
+                ("system", load_prompt(INPUT_ROUTER_PROMPT_PATH)),
                 ("human", message),
             ]
         )
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"OpenAI intent router invoke failed: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"OpenAI input router invoke failed: {exc}") from exc
 
-    route = extract_structured_output(result, "route_intent", INTENT_ROUTER_MODEL_NAME)
-    if route.get("intent") not in {"command", "conversation"}:
-        raise HTTPException(status_code=503, detail=f"route_intent returned invalid intent: {route.get('intent')}")
-
-    return route
-
-
-async def classify_command_type(message: str) -> dict:
-    try:
-        result = await command_type_classifier_model.ainvoke(
-            [
-                ("system", load_prompt(COMMAND_TYPE_CLASSIFIER_PROMPT_PATH)),
-                ("human", message),
-            ]
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"OpenAI command type classifier invoke failed: {exc}") from exc
-
-    route = extract_structured_output(result, "classify_command_type", COMMAND_TYPE_CLASSIFIER_MODEL_NAME)
-    if route.get("command_type") not in {"immediate_command", "goal_command", "unsupported_or_unknown"}:
-        raise HTTPException(
-            status_code=503,
-            detail=f"classify_command_type returned invalid command_type: {route.get('command_type')}",
-        )
+    route = extract_structured_output(result, "route_input", INPUT_ROUTER_MODEL_NAME)
+    if route.get("route") not in {
+        "general_dialogue",
+        "capability_question",
+        "immediate_command",
+        "goal_command",
+        "unsupported_or_unknown",
+    }:
+        raise HTTPException(status_code=503, detail=f"route_input returned invalid route: {route.get('route')}")
 
     return route
 
 
-async def classify_dialogue_type(message: str) -> dict:
-    try:
-        result = await dialogue_type_classifier_model.ainvoke(
-            [
-                ("system", load_prompt(DIALOGUE_TYPE_CLASSIFIER_PROMPT_PATH)),
-                ("human", message),
-            ]
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"OpenAI dialogue type classifier invoke failed: {exc}") from exc
-
-    route = extract_structured_output(result, "classify_dialogue_type", DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME)
-    if route.get("dialogue_type") not in {"general_dialogue", "capability_question"}:
-        raise HTTPException(
-            status_code=503,
-            detail=f"classify_dialogue_type returned invalid dialogue_type: {route.get('dialogue_type')}",
-        )
-
-    return route
+def build_legacy_intent_route(input_route: dict) -> dict:
+    route = input_route.get("route")
+    intent = "conversation" if route in {"general_dialogue", "capability_question"} else "command"
+    return {
+        "intent": intent,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
 
 
-async def build_dialogue_command(message: str, include_capabilities: bool = False) -> dict:
+def build_legacy_dialogue_type_route(input_route: dict) -> dict | None:
+    route = input_route.get("route")
+    if route not in {"general_dialogue", "capability_question"}:
+        return None
+
+    return {
+        "dialogue_type": route,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
+
+
+def build_legacy_command_type_route(input_route: dict) -> dict | None:
+    route = input_route.get("route")
+    if route in {"general_dialogue", "capability_question"}:
+        return None
+
+    return {
+        "command_type": route,
+        "goal": input_route.get("goal") if route == "goal_command" else None,
+        "confidence": input_route.get("confidence"),
+        "reason": input_route.get("reason"),
+    }
+
+
+async def build_dialogue_command(
+    message: str,
+    include_capabilities: bool = False,
+    route_name: str | None = None,
+) -> dict:
     system_prompt = (
         "You are a friendly Unity NPC. Answer questions and small talk in Korean. "
         "Do not claim that you performed any physical action."
@@ -482,7 +469,8 @@ async def build_dialogue_command(message: str, include_capabilities: bool = Fals
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI dialogue invoke failed: {exc}") from exc
 
-    response = extract_structured_output(result, "build_dialogue_command", INTENT_ROUTER_MODEL_NAME)
+    operation = f"build_dialogue_command[{route_name}]" if route_name else "build_dialogue_command"
+    response = extract_structured_output(result, operation, INPUT_ROUTER_MODEL_NAME)
     return build_noop_command(response.get("message"))
 
 

@@ -35,6 +35,14 @@ CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
 OBJECT_DATABASE_PATH = Path(__file__).with_name("object_database.json")
 
 
+class Vector3Dict(TypedDict):
+    """3D world position."""
+
+    x: Annotated[float, ..., "World x coordinate."]
+    y: Annotated[float, ..., "World y coordinate."]
+    z: Annotated[float, ..., "World z coordinate."]
+
+
 class CommandStep(TypedDict):
     """One ordered intent step extracted from the user's command."""
 
@@ -46,12 +54,27 @@ class CommandStep(TypedDict):
     target: Annotated[
         str | None,
         ...,
-        "Target object or place name for this step in English. Use null if the step has no target.",
+        "Legacy target object or place name. Prefer object_name for new outputs.",
     ]
     object: Annotated[
         str | None,
         ...,
-        "Resolved Unity object id for this step. Use null until Unity returns a concrete object_id.",
+        "Legacy resolved Unity object id. Prefer object_id for new outputs.",
+    ]
+    object_name: Annotated[
+        str | None,
+        ...,
+        "Target object or place name in English. Use null if the step has no named target.",
+    ]
+    object_id: Annotated[
+        str | None,
+        ...,
+        "Resolved Unity object id for this step. Use null until Unity resolves a concrete object id.",
+    ]
+    position: Annotated[
+        Vector3Dict | None,
+        ...,
+        "Target world position for coordinate movement. Use null when moving to a named object.",
     ]
     count: Annotated[
         int | None,
@@ -71,17 +94,32 @@ class CommandDict(TypedDict):
     destination: Annotated[
         str | None,
         ...,
-        "Destination to move to. Use coordinates like (5, 5) or an object location like apple. Use null unless action requires a destination.",
+        "Legacy target destination name. Prefer object_name or position for new outputs.",
     ]
     item: Annotated[
         str | None,
         ...,
-        "Object to fetch or interact with. Use null unless action requires an item.",
+        "Legacy target item name. Prefer object_name for new outputs.",
     ]
     object: Annotated[
         str | None,
         ...,
-        "Resolved Unity object id to execute against. Use null until Unity returns a concrete object_id.",
+        "Legacy resolved Unity object id. Prefer object_id for new outputs.",
+    ]
+    object_name: Annotated[
+        str | None,
+        ...,
+        "Primary target object or place name in English.",
+    ]
+    object_id: Annotated[
+        str | None,
+        ...,
+        "Resolved Unity object id to execute against. Use null until Unity resolves it.",
+    ]
+    position: Annotated[
+        Vector3Dict | None,
+        ...,
+        "Target world position for coordinate movement. Use null for named object targets.",
     ]
     steps: Annotated[
         list[CommandStep],
@@ -182,7 +220,7 @@ def build_system_prompt() -> str:
 app = FastAPI(
     title="ActNPC Backend",
     version="0.1.0",
-    description="FastAPI backend for the Unity 2D intelligent NPC agent MVP.",
+    description="FastAPI backend for the Unity intelligent NPC agent."
 )
 
 
@@ -515,7 +553,7 @@ async def normalize_to_minimal_command(
     try:
         result = await model.ainvoke(
             [
-                ("system", build_system_prompt()),
+                ("system", load_prompt(COMMAND_NORMALIZER_PROMPT_PATH)),
                 ("human", normalization_prompt),
             ]
         )
@@ -526,7 +564,14 @@ async def normalize_to_minimal_command(
 
 
 def build_normalization_prompt(user_message: str, command_data: dict, client_context: dict | None) -> str:
-    return Template(load_prompt(COMMAND_NORMALIZER_PROMPT_PATH)).safe_substitute(
+    return Template(
+        "Original:\n"
+        "$user_message\n\n"
+        "Parsed:\n"
+        "$command_data_json\n\n"
+        "Unity context:\n"
+        "$client_context_json"
+    ).safe_substitute(
         user_message=user_message,
         command_data_json=json.dumps(command_data, ensure_ascii=False),
         client_context_json=json.dumps(client_context, ensure_ascii=False),
@@ -678,23 +723,34 @@ def apply_resolved_object_ids(command_data: dict, client_context: dict | None) -
             if not isinstance(step_index, int) or step_index < 0 or step_index >= len(steps):
                 continue
 
-            object_id = extract_first_object_id(step_context.get("context"))
+            object_id = extract_context_target_id(step_context.get("context"), step_context.get("target"))
             if not object_id:
                 continue
 
+            steps[step_index]["object_id"] = object_id
             steps[step_index]["object"] = object_id
             if first_object_id is None:
                 first_object_id = object_id
 
         command_data["steps"] = steps
         if first_object_id:
+            command_data["object_id"] = first_object_id
             command_data["object"] = first_object_id
 
         return
 
-    object_id = extract_first_object_id(client_context)
+    object_id = extract_context_target_id(client_context, get_command_target_name(command_data))
     if object_id:
+        command_data["object_id"] = object_id
         command_data["object"] = object_id
+
+
+def extract_context_target_id(context: dict | None, target: object = None) -> str | None:
+    object_id = extract_first_object_id(context)
+    if object_id:
+        return object_id
+
+    return extract_inventory_item_id(context, target)
 
 
 def extract_first_object_id(context: dict | None) -> str | None:
@@ -718,6 +774,38 @@ def extract_first_object_id(context: dict | None) -> str | None:
     return None
 
 
+def extract_inventory_item_id(context: dict | None, target: object = None) -> str | None:
+    if not context:
+        return None
+
+    inventory = context.get("inventory")
+    if not isinstance(inventory, list) or not inventory:
+        return None
+
+    normalized_target = str(target).strip().lower() if target is not None else ""
+    first_item_id = None
+
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+
+        item_id = item.get("itemId")
+        item_name = item.get("itemName")
+        item_id_text = str(item_id).strip() if item_id is not None else ""
+        if first_item_id is None and item_id_text:
+            first_item_id = item_id_text
+
+        if not normalized_target:
+            continue
+
+        if item_id_text.lower() == normalized_target:
+            return item_id_text
+        if isinstance(item_name, str) and item_name.strip().lower() == normalized_target:
+            return item_id_text
+
+    return first_item_id if not normalized_target else None
+
+
 def build_actions(command_data: dict) -> list[dict]:
     steps = ensure_command_steps(command_data)
     if steps:
@@ -725,11 +813,15 @@ def build_actions(command_data: dict) -> list[dict]:
 
         for step in steps:
             action = normalize_action(step.get("action"))
-            object_id = step.get("object")
+            object_id = get_step_object_id(step)
+            target = get_step_target(step)
 
             if action == "stop":
                 actions.append(build_action("STOP", None, len(actions) + 1))
                 continue
+
+            if action == "put_item" and not object_id:
+                object_id = target
 
             if not object_id:
                 continue
@@ -743,13 +835,18 @@ def build_actions(command_data: dict) -> list[dict]:
                 )
             elif action == "get_item":
                 actions.append(build_action("GET_ITEM", object_id, len(actions) + 1))
+            elif action == "put_item":
+                actions.append(build_action("PUT_ITEM", object_id, len(actions) + 1))
             elif action == "move":
                 actions.append(build_action("MOVE_TO", object_id, len(actions) + 1))
 
         return actions
 
     action = normalize_action(command_data.get("action"))
-    object_id = command_data.get("object")
+    object_id = get_command_object_id(command_data)
+    target = get_command_target_name(command_data)
+    if action == "put_item" and not object_id:
+        object_id = target
 
     if action == "stop":
         return [
@@ -765,6 +862,11 @@ def build_actions(command_data: dict) -> list[dict]:
     if action == "get_item" and object_id:
         return [
             build_action("GET_ITEM", object_id, 1),
+        ]
+
+    if action == "put_item" and object_id:
+        return [
+            build_action("PUT_ITEM", object_id, 1),
         ]
 
     if action == "move" and object_id:
@@ -794,6 +896,8 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
         for step_index, step in enumerate(steps):
             action = normalize_action(step.get("action"))
             target = get_step_target(step)
+            if action == "put_item":
+                continue
             if action not in {"move", "fetch", "get_item"} or not target:
                 continue
 
@@ -820,8 +924,8 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
         return {"steps": step_contexts} if step_contexts else None
 
     action = normalize_action(command_data.get("action"))
-    item = command_data.get("item")
-    destination = command_data.get("destination")
+    item = first_non_empty(command_data.get("object_name"), command_data.get("item"))
+    destination = first_non_empty(command_data.get("object_name"), command_data.get("destination"))
 
     if action in {"fetch", "get_item"} and item:
         return await request_unity_function(
@@ -854,13 +958,16 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
         return expand_counted_steps([step for step in raw_steps if isinstance(step, dict)])
 
     action = normalize_action(command_data.get("action"))
-    target = first_non_empty(command_data.get("item"), command_data.get("destination"))
-    if action in {"move", "fetch", "get_item"} and target:
+    target = get_command_target_name(command_data)
+    if action in {"move", "fetch", "get_item", "put_item"} and target:
         return [
             {
                 "action": action,
                 "target": target,
-                "object": command_data.get("object"),
+                "object": get_command_object_id(command_data),
+                "object_name": target,
+                "object_id": get_command_object_id(command_data),
+                "position": command_data.get("position"),
                 "count": None,
             }
         ]
@@ -871,6 +978,9 @@ def ensure_command_steps(command_data: dict) -> list[dict]:
                 "action": action,
                 "target": None,
                 "object": None,
+                "object_name": None,
+                "object_id": None,
+                "position": None,
                 "count": None,
             }
         ]
@@ -883,7 +993,7 @@ def expand_counted_steps(steps: list[dict]) -> list[dict]:
 
     for step in steps:
         action = normalize_action(step.get("action"))
-        repeat_count = get_step_count(step) if action in {"fetch", "get_item"} else 1
+        repeat_count = get_step_count(step) if action in {"fetch", "get_item", "put_item"} else 1
 
         for _ in range(repeat_count):
             expanded_step = dict(step)
@@ -905,14 +1015,28 @@ def get_step_count(step: dict) -> int:
 def steps_need_object_resolution(command_data: dict) -> bool:
     for step in ensure_command_steps(command_data):
         action = normalize_action(step.get("action"))
-        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not step.get("object"):
+        if action == "put_item":
+            continue
+        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not get_step_object_id(step):
             return True
 
     return False
 
 
 def get_step_target(step: dict) -> str | None:
-    return first_non_empty(step.get("target"), step.get("item"), step.get("destination"))
+    return first_non_empty(step.get("object_name"), step.get("target"), step.get("item"), step.get("destination"))
+
+
+def get_step_object_id(step: dict) -> str | None:
+    return first_non_empty(step.get("object_id"), step.get("object"))
+
+
+def get_command_target_name(command_data: dict) -> str | None:
+    return first_non_empty(command_data.get("object_name"), command_data.get("item"), command_data.get("destination"))
+
+
+def get_command_object_id(command_data: dict) -> str | None:
+    return first_non_empty(command_data.get("object_id"), command_data.get("object"))
 
 
 def normalize_action(action: object) -> str | None:

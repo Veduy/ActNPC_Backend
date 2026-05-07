@@ -6,7 +6,8 @@ Classify the user's input into exactly one route:
 
 Rules:
 - If the input contains any clear request for the NPC to move, stop, pick up, fetch, collect, bring, interact with, or otherwise act in the Unity world, return command.
-- If the input is phrased as a question but actually asks the NPC to act, return command.
+- If the input only asks whether the NPC can perform an action, whether an action is possible, or what actions are available, return conversation.
+- Return command for question-shaped requests only when the user is asking the NPC to actually perform the action now.
 - If the input mixes conversation and a physical NPC action, return command.
 - If the input only asks what something is, where something is, how the NPC is doing, or contains greetings/small talk, return conversation.
 - For ambiguous input, return conversation unless there is a clear physical NPC action request.

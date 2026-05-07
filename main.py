@@ -19,6 +19,8 @@ load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-4.1-nano"
 INTENT_ROUTER_MODEL_NAME = "gpt-4.1-nano"
+DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME = "gpt-4.1-nano"
+COMMAND_TYPE_CLASSIFIER_MODEL_NAME = "gpt-4.1-nano"
 MODEL_PRICING_PER_1M_TOKENS = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
@@ -27,8 +29,12 @@ MODEL_PRICING_PER_1M_TOKENS = {
 }
 base_model = init_chat_model(MODEL_NAME)
 intent_router_base_model = init_chat_model(INTENT_ROUTER_MODEL_NAME)
+dialogue_type_classifier_base_model = init_chat_model(DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME)
+command_type_classifier_base_model = init_chat_model(COMMAND_TYPE_CLASSIFIER_MODEL_NAME)
 PROMPTS_DIR = Path(__file__).with_name("prompts")
 INTENT_ROUTER_PROMPT_PATH = PROMPTS_DIR / "intent_router_system.md"
+DIALOGUE_TYPE_CLASSIFIER_PROMPT_PATH = PROMPTS_DIR / "dialogue_type_classifier_system.md"
+COMMAND_TYPE_CLASSIFIER_PROMPT_PATH = PROMPTS_DIR / "command_type_classifier_system.md"
 COMMAND_PARSER_PROMPT_PATH = PROMPTS_DIR / "command_parser_system.md"
 COMMAND_NORMALIZER_PROMPT_PATH = PROMPTS_DIR / "command_normalizer.md"
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
@@ -109,7 +115,38 @@ class DialogueResponse(TypedDict):
     message: Annotated[str, ..., "Natural Korean response for the user."]
 
 
+class DialogueTypeRoute(TypedDict):
+    """Second-pass route for conversation inputs."""
+
+    dialogue_type: Annotated[
+        Literal["general_dialogue", "capability_question"],
+        ...,
+        "Use capability_question only when the user asks what the NPC can do or whether a Unity action is possible.",
+    ]
+    confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
+    reason: Annotated[str, ..., "Short English reason for the dialogue type."]
+
+
+class CommandTypeRoute(TypedDict):
+    """Second-pass route for executable command inputs."""
+
+    command_type: Annotated[
+        Literal["immediate_command", "goal_command", "unsupported_or_unknown"],
+        ...,
+        "Use immediate_command for direct primitive actions, goal_command for planned multi-step goals, unsupported_or_unknown otherwise.",
+    ]
+    goal: Annotated[
+        str | None,
+        ...,
+        "Concise English goal when command_type is goal_command, otherwise null.",
+    ]
+    confidence: Annotated[float, ..., "Classifier confidence from 0.0 to 1.0."]
+    reason: Annotated[str, ..., "Short English reason for the command type."]
+
+
 intent_router_model = intent_router_base_model.with_structured_output(IntentRoute, include_raw=True)
+dialogue_type_classifier_model = dialogue_type_classifier_base_model.with_structured_output(DialogueTypeRoute, include_raw=True)
+command_type_classifier_model = command_type_classifier_base_model.with_structured_output(CommandTypeRoute, include_raw=True)
 dialogue_model = intent_router_base_model.with_structured_output(DialogueResponse, include_raw=True)
 model = base_model.with_structured_output(CommandDict, include_raw=True)
 
@@ -188,12 +225,14 @@ def health_check():
 async def openai_health_check(
     message: str = Query(..., min_length=1, description="Natural language input for the connected model"),
 ):
-    route, command = await handle_user_input(message)
+    route, dialogue_type_route, command_type_route, command = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
         "intent_route": route,
+        "dialogue_type_route": dialogue_type_route,
+        "command_type_route": command_type_route,
         "command": command,
     }
 
@@ -215,12 +254,14 @@ async def command(
         Body(..., embed=True, min_length=1, description="Natural language command from Unity."),
     ],
 ):
-    route, command_data = await handle_user_input(message)
+    route, dialogue_type_route, command_type_route, command_data = await handle_user_input(message)
 
     return {
         "status": "ok",
         "input": message,
         "intent_route": route,
+        "dialogue_type_route": dialogue_type_route,
+        "command_type_route": command_type_route,
         "command": command_data,
     }
 
@@ -264,7 +305,7 @@ async def websocket_agent(websocket: WebSocket):
 
             user_message = raw_message
             try:
-                route, command_data = await handle_user_input(user_message)
+                route, dialogue_type_route, command_type_route, command_data = await handle_user_input(user_message)
             except HTTPException as exc:
                 await websocket.send_json(
                     {
@@ -286,6 +327,23 @@ async def websocket_agent(websocket: WebSocket):
                         "status": "ok",
                         "input": user_message,
                         "intent_route": route,
+                        "dialogue_type_route": dialogue_type_route,
+                        "command_type_route": command_type_route,
+                        "command": command_data,
+                        "client_context": None,
+                    }
+                )
+                continue
+
+            if command_type_route and command_type_route.get("command_type") != "immediate_command":
+                await websocket.send_json(
+                    {
+                        "type": "final_command",
+                        "status": "ok",
+                        "input": user_message,
+                        "intent_route": route,
+                        "dialogue_type_route": dialogue_type_route,
+                        "command_type_route": command_type_route,
                         "command": command_data,
                         "client_context": None,
                     }
@@ -311,6 +369,8 @@ async def websocket_agent(websocket: WebSocket):
                     "status": "ok",
                     "input": user_message,
                     "intent_route": route,
+                    "dialogue_type_route": dialogue_type_route,
+                    "command_type_route": command_type_route,
                     "command": command_data,
                     "client_context": client_context,
                 }
@@ -320,12 +380,21 @@ async def websocket_agent(websocket: WebSocket):
         print("Unity client disconnected")
 
 
-async def handle_user_input(message: str) -> tuple[dict, dict]:
+async def handle_user_input(message: str) -> tuple[dict, dict | None, dict | None, dict]:
     route = await route_intent(message)
     if route.get("intent") == "conversation":
-        return route, await build_dialogue_command(message)
+        dialogue_type_route = await classify_dialogue_type(message)
+        include_capabilities = dialogue_type_route.get("dialogue_type") == "capability_question"
+        return route, dialogue_type_route, None, await build_dialogue_command(message, include_capabilities)
 
-    return route, await parse_command(message)
+    command_type_route = await classify_command_type(message)
+    command_type = command_type_route.get("command_type")
+    if command_type == "immediate_command":
+        return route, None, command_type_route, await parse_command(message)
+    if command_type == "goal_command":
+        return route, None, command_type_route, build_noop_command("목표형 명령으로 이해했지만, 아직 Planner가 연결되지 않았어요.")
+
+    return route, None, command_type_route, build_noop_command("명령으로 이해했지만, 아직 실행 가능한 형태로 분류하지 못했어요.")
 
 
 async def route_intent(message: str) -> dict:
@@ -346,15 +415,67 @@ async def route_intent(message: str) -> dict:
     return route
 
 
-async def build_dialogue_command(message: str) -> dict:
+async def classify_command_type(message: str) -> dict:
+    try:
+        result = await command_type_classifier_model.ainvoke(
+            [
+                ("system", load_prompt(COMMAND_TYPE_CLASSIFIER_PROMPT_PATH)),
+                ("human", message),
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OpenAI command type classifier invoke failed: {exc}") from exc
+
+    route = extract_structured_output(result, "classify_command_type", COMMAND_TYPE_CLASSIFIER_MODEL_NAME)
+    if route.get("command_type") not in {"immediate_command", "goal_command", "unsupported_or_unknown"}:
+        raise HTTPException(
+            status_code=503,
+            detail=f"classify_command_type returned invalid command_type: {route.get('command_type')}",
+        )
+
+    return route
+
+
+async def classify_dialogue_type(message: str) -> dict:
+    try:
+        result = await dialogue_type_classifier_model.ainvoke(
+            [
+                ("system", load_prompt(DIALOGUE_TYPE_CLASSIFIER_PROMPT_PATH)),
+                ("human", message),
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OpenAI dialogue type classifier invoke failed: {exc}") from exc
+
+    route = extract_structured_output(result, "classify_dialogue_type", DIALOGUE_TYPE_CLASSIFIER_MODEL_NAME)
+    if route.get("dialogue_type") not in {"general_dialogue", "capability_question"}:
+        raise HTTPException(
+            status_code=503,
+            detail=f"classify_dialogue_type returned invalid dialogue_type: {route.get('dialogue_type')}",
+        )
+
+    return route
+
+
+async def build_dialogue_command(message: str, include_capabilities: bool = False) -> dict:
+    system_prompt = (
+        "You are a friendly Unity NPC. Answer questions and small talk in Korean. "
+        "Do not claim that you performed any physical action."
+    )
+    if include_capabilities:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "Unity capabilities manifest:\n"
+            "```json\n"
+            f"{load_unity_capabilities_text()}\n"
+            "```\n\n"
+            "If the user asks whether an action is possible, answer based on the manifest."
+        )
+
     try:
         result = await dialogue_model.ainvoke(
             [
-                (
-                    "system",
-                    "You are a friendly Unity NPC. Answer questions and small talk in Korean. "
-                    "Do not claim that you performed any physical action.",
-                ),
+                ("system", system_prompt),
                 ("human", message),
             ]
         )

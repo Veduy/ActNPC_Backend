@@ -62,31 +62,5 @@
     "If the user's goal cannot be completed using only executable_actions, do not invent Unity commands. Return action null, steps empty, and explain that the required Unity capability is not available yet.",
     "Keep target names concise. Use the object or place name only, without generic words such as location, place, position, near, or around.",
     "Translate all command field values into English."
-  ],
-  "output_examples": [
-    {
-      "user": "사과로 이동했다가 박스 위치로 이동해",
-      "steps": [
-        { "action": "move", "target": "apple", "object": null },
-        { "action": "move", "target": "box", "object": null }
-      ]
-    },
-    {
-      "user": "사과를 가져와",
-      "steps": [
-        { "action": "fetch", "target": "apple", "object": null }
-      ]
-    },
-    {
-      "user": "사과를 주워",
-      "steps": [
-        { "action": "get_item", "target": "apple", "object": null }
-      ]
-    },
-    {
-      "user": "사다리를 만들어",
-      "steps": [],
-      "message": "I cannot make a ladder yet because Unity does not currently expose the required crafting capability."
-    }
   ]
 }

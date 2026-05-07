@@ -11,9 +11,8 @@ Rules:
 - Map requests to bring, fetch, retrieve, or get an item for the user to fetch.
 - Map requests to go to, move to, approach, or head toward a target to move.
 - Break executable compound requests into ordered steps. Include one step per executable user request, and preserve the user's requested order.
-- One item step means one item instance.
-- If the user does not provide a count or all/every wording, create one item step for a direct pickup or fetch request.
-- For explicit item counts, immediately repeat the item step that many times.
+- For item actions with an explicit requested count, set step.count to that positive integer instead of repeating the step.
+- If the user does not provide a count or all/every wording, set step.count=null.
 - For all/every matching item requests, represent them as one requested item action; the final normalization pass will expand them after Unity context is available.
 - Do not infer extra physical actions that the user did not ask for, except when an executable capability explicitly defines a compound Unity action.
 - If phrasing is ambiguous between a physical command and a question or conversation, prefer no executable steps unless the user is clearly asking the NPC to act in the Unity world.

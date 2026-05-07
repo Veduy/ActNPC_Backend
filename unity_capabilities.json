@@ -1,0 +1,92 @@
+{
+  "version": "0.1.0",
+  "purpose": "Capabilities currently executable by the Unity NPC runtime.",
+  "runtime_contract": {
+    "planner_role": "Convert user intent into ordered steps using only executable_actions.",
+    "unity_role": "Resolve scene objects, validate existence, and execute final actions.",
+    "target_resolution": "Use object names or aliases in steps. Unity will resolve them into object_id values before execution."
+  },
+  "executable_actions": [
+    {
+      "intent_action": "move",
+      "unity_command": "MOVE_TO",
+      "description": "Move the NPC to a scene object or location.",
+      "target_type": "location",
+      "target_required": true,
+      "examples": [
+        "go to the apple",
+        "move to the box",
+        "사과 위치로 이동해"
+      ]
+    },
+    {
+      "intent_action": "fetch",
+      "unity_commands": ["MOVE_TO", "GET_ITEM"],
+      "description": "Move to an item and pick it up.",
+      "target_type": "item",
+      "target_required": true,
+      "examples": [
+        "bring me the apple",
+        "get the box",
+        "사과를 가져와"
+      ]
+    },
+    {
+      "intent_action": "get_item",
+      "unity_command": "GET_ITEM",
+      "description": "Pick up an item directly. If Unity reports this action failed because the item is too far away, the backend can ask the AI to create a recovery plan.",
+      "target_type": "item",
+      "target_required": true,
+      "examples": [
+        "pick up the apple",
+        "grab the box",
+        "사과를 주워"
+      ]
+    },
+    {
+      "intent_action": "stop",
+      "unity_command": "STOP",
+      "description": "Stop the NPC's current queued or active actions.",
+      "target_required": false,
+      "examples": [
+        "stop",
+        "halt",
+        "멈춰"
+      ]
+    }
+  ],
+  "planning_rules": [
+    "Only use executable_actions when producing steps.",
+    "Use get_item for direct pickup requests.",
+    "For compound requests, produce one step per requested executable action in order.",
+    "If the user's goal cannot be completed using only executable_actions, do not invent Unity commands. Return action null, steps empty, and explain that the required Unity capability is not available yet.",
+    "Keep target names concise. Use the object or place name only, without generic words such as location, place, position, near, or around.",
+    "Translate all command field values into English."
+  ],
+  "output_examples": [
+    {
+      "user": "사과로 이동했다가 박스 위치로 이동해",
+      "steps": [
+        { "action": "move", "target": "apple", "object": null },
+        { "action": "move", "target": "box", "object": null }
+      ]
+    },
+    {
+      "user": "사과를 가져와",
+      "steps": [
+        { "action": "fetch", "target": "apple", "object": null }
+      ]
+    },
+    {
+      "user": "사과를 주워",
+      "steps": [
+        { "action": "get_item", "target": "apple", "object": null }
+      ]
+    },
+    {
+      "user": "사다리를 만들어",
+      "steps": [],
+      "message": "I cannot make a ladder yet because Unity does not currently expose the required crafting capability."
+    }
+  ]
+}

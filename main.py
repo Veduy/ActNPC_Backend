@@ -10,11 +10,7 @@ from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
 
 from paring_tools import parse_command
-from unity_tools import (
-    is_client_function_result,
-    load_unity_capabilities,
-    parse_json_text,
-)
+from unity_tools import load_unity_capabilities
 
 load_dotenv()
 
@@ -114,33 +110,7 @@ async def websocket_agent(websocket: WebSocket):
 
     try:
         while True:
-            raw_message = await websocket.receive_text()
-
-            parsed_message = parse_json_text(raw_message)
-            if is_client_function_result(parsed_message):
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "payload": {
-                            "code": "UNEXPECTED_CLIENT_FUNCTION_RESULT",
-                            "message": "Client function result was received without a pending server request.",
-                        },
-                    }
-                )
-                continue
-            if parsed_message is not None and parsed_message.get("type") == "action_result":
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "payload": {
-                            "code": "ACTION_RESULT_IGNORED",
-                            "message": "Action result handling is disabled in the simplified backend flow.",
-                        },
-                    }
-                )
-                continue
-
-            user_message = raw_message
+            user_message = await websocket.receive_text()
             try:
                 input_route, command_data = await handle_user_input(user_message)
             except HTTPException as exc:

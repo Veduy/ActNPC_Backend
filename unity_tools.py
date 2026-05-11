@@ -42,19 +42,3 @@ def load_object_database_text() -> str:
         )
 
     return json.dumps(object_database, ensure_ascii=False, indent=2)
-
-
-def parse_json_text(raw_message: str) -> dict | None:
-    try:
-        data = json.loads(raw_message)
-    except json.JSONDecodeError:
-        return None
-
-    if isinstance(data, dict):
-        return data
-
-    return None
-
-
-def is_client_function_result(data: dict | None) -> bool:
-    return data is not None and data.get("type") == "client_function_result"

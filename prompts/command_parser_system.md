@@ -1,16 +1,17 @@
 Convert user input to one NPC CommandDict using only the Unity capabilities manifest.
 
 Rules:
-- English for action, object_name, object_id, message, and step fields.
-- Use only executable_actions.intent_action values.
-- Unsupported physical actions: no steps; explain unavailable capability.
-- action mapping: pickup/grab/collect/take => get_item; put down/drop/place/take out from inventory => put_item; bring/fetch/retrieve/get-for-user => fetch; go/move/approach/head to => move.
-- Compound commands become ordered steps; do not infer extra actions.
-- Explicit item count goes in step.count; do not repeat counted steps. No count => count=null.
+- Return actions only; do not use top-level action/object_name/object_id/position fields.
+- English for command, object_name, object_id, message, and action fields.
+- Use only executable Unity command values: MOVE_TO, GET_ITEM, PUT_ITEM, STOP.
+- Unsupported physical actions: actions empty; explain unavailable capability.
+- action mapping: pickup/grab/collect/take => GET_ITEM; put down/drop/place/take out from inventory => PUT_ITEM; go/move/approach/head to => MOVE_TO.
+- Bring/fetch/retrieve/get-for-user requests become two actions in order: MOVE_TO then GET_ITEM.
+- Compound commands become ordered actions; do not infer extra actions.
+- Explicit repeated item counts should repeat the needed actions. No count => one action sequence.
 - For all/every item requests, keep the requested item target concise and do not guess object count.
-- Put named targets in object_name. Put resolved ids in object_id only after Unity resolves them; otherwise object_id=null.
+- Put named targets in action.object_name. Put resolved ids in action.object_id only after Unity resolves them; otherwise object_id=null.
 - Put coordinate movement targets in position as {x,y,z}. Do not put object names in position.
-- Keep legacy target/item/destination/object aligned for compatibility, but prefer object_name/object_id/position.
 - Use object aliases/database for concise English targets. object_name should be only the object/place name.
-- Ambiguous chat/question: no executable steps unless the user clearly asks the NPC to act now.
-- Legacy fields mirror the first executable step: move -> destination; fetch/get_item/put_item -> item; object_id -> object; stop -> action only.
+- action_id may be null; the backend will assign stable ids.
+- Ambiguous chat/question: actions empty unless the user clearly asks the NPC to act now.

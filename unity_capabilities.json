@@ -2,9 +2,9 @@
   "version": "0.1.0",
   "purpose": "Capabilities currently executable by the Unity NPC runtime.",
   "runtime_contract": {
-    "planner_role": "Convert user intent into ordered steps using only executable_actions.",
+    "planner_role": "Convert user intent into ordered actions using only executable_actions.",
     "unity_role": "Resolve scene objects, validate existence, and execute final actions.",
-    "target_resolution": "Use object names or aliases in steps. Unity resolves them into object_id values before execution."
+    "target_resolution": "Use object names or aliases in actions. Unity resolves them into object_id values before execution."
   },
   "executable_actions": [
     {
@@ -48,11 +48,11 @@
     }
   ],
   "planning_rules": [
-    "Only use executable_actions when producing steps.",
+    "Only use executable_actions when producing actions.",
     "Use get_item for direct pickup requests.",
     "Use put_item for requests to put down, drop, or place an inventory item in the world.",
-    "For compound requests, produce one step per requested executable action in order.",
-    "If the user's goal cannot be completed using only executable_actions, do not invent Unity commands. Return action null, steps empty, and explain that the required Unity capability is not available yet.",
+    "For compound requests, produce one action per requested executable action in order.",
+    "If the user's goal cannot be completed using only executable_actions, do not invent Unity commands. Return actions empty, and explain that the required Unity capability is not available yet.",
     "Keep target names concise. Use the object or place name only, without generic words such as location, place, position, near, or around.",
     "Translate all command field values into English."
   ]

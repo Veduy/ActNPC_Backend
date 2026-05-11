@@ -95,12 +95,7 @@ async def handle_action_result(
 
 
 def finalize_unity_command(command_data: dict) -> dict:
-    command_data["intent_action"] = command_data.get("action")
     command_data["actions"] = build_actions(command_data)
-    command_data["action"] = None
-    command_data["destination"] = None
-    command_data["item"] = None
-    command_data["object"] = None
     return command_data
 
 
@@ -108,39 +103,25 @@ def apply_resolved_object_ids(command_data: dict, client_context: dict | None) -
     if not client_context:
         return
 
-    step_contexts = client_context.get("steps")
-    if isinstance(step_contexts, list):
-        steps = ensure_command_steps(command_data)
-        first_object_id = None
+    action_contexts = client_context.get("actions")
+    if isinstance(action_contexts, list):
+        actions = ensure_command_actions(command_data)
 
-        for step_context in step_contexts:
-            if not isinstance(step_context, dict):
+        for action_context in action_contexts:
+            if not isinstance(action_context, dict):
                 continue
 
-            step_index = step_context.get("step_index")
-            if not isinstance(step_index, int) or step_index < 0 or step_index >= len(steps):
+            action_index = action_context.get("action_index")
+            if not isinstance(action_index, int) or action_index < 0 or action_index >= len(actions):
                 continue
 
-            object_id = extract_context_target_id(step_context.get("context"), step_context.get("target"))
+            object_id = extract_context_target_id(action_context.get("context"), action_context.get("target"))
             if not object_id:
                 continue
 
-            steps[step_index]["object_id"] = object_id
-            steps[step_index]["object"] = object_id
-            if first_object_id is None:
-                first_object_id = object_id
+            actions[action_index]["object_id"] = object_id
 
-        command_data["steps"] = steps
-        if first_object_id:
-            command_data["object_id"] = first_object_id
-            command_data["object"] = first_object_id
-
-        return
-
-    object_id = extract_context_target_id(client_context, get_command_target_name(command_data))
-    if object_id:
-        command_data["object_id"] = object_id
-        command_data["object"] = object_id
+        command_data["actions"] = actions
 
 
 def extract_context_target_id(context: dict | None, target: object = None) -> str | None:
@@ -205,98 +186,36 @@ def extract_inventory_item_id(context: dict | None, target: object = None) -> st
 
 
 def build_actions(command_data: dict) -> list[dict]:
-    steps = ensure_command_steps(command_data)
-    if steps:
-        actions = []
-
-        for step in steps:
-            action = normalize_action(step.get("action"))
-            object_id = get_step_object_id(step)
-            target = get_step_target(step)
-
-            if action == "stop":
-                actions.append(build_action("STOP", None, len(actions) + 1))
-                continue
-
-            if action == "put_item" and not object_id:
-                object_id = target
-
-            if not object_id:
-                continue
-
-            if action == "fetch":
-                actions.extend(
-                    [
-                        build_action("MOVE_TO", object_id, len(actions) + 1),
-                        build_action("GET_ITEM", object_id, len(actions) + 2),
-                    ]
-                )
-            elif action == "get_item":
-                actions.append(build_action("GET_ITEM", object_id, len(actions) + 1))
-            elif action == "put_item":
-                actions.append(build_action("PUT_ITEM", object_id, len(actions) + 1))
-            elif action == "move":
-                actions.append(build_action("MOVE_TO", object_id, len(actions) + 1))
-
-        return actions
-
-    action = normalize_action(command_data.get("action"))
-    object_id = get_command_object_id(command_data)
-    target = get_command_target_name(command_data)
-    if action == "put_item" and not object_id:
-        object_id = target
-
-    if action == "stop":
-        return [
-            build_action("STOP", None, 1),
-        ]
-
-    if action == "fetch" and object_id:
-        return [
-            build_action("MOVE_TO", object_id, 1),
-            build_action("GET_ITEM", object_id, 2),
-        ]
-
-    if action == "get_item" and object_id:
-        return [
-            build_action("GET_ITEM", object_id, 1),
-        ]
-
-    if action == "put_item" and object_id:
-        return [
-            build_action("PUT_ITEM", object_id, 1),
-        ]
-
-    if action == "move" and object_id:
-        return [
-            build_action("MOVE_TO", object_id, 1),
-        ]
-
-    return []
+    return ensure_command_actions(command_data)
 
 
-def build_action(command: str, target_id: str | None, index: int) -> dict:
-    action = {
+def build_action(
+    command: str,
+    object_name: str | None,
+    object_id: str | None,
+    position: dict | None,
+    index: int,
+) -> dict:
+    return {
         "action_id": f"act_{index:03d}",
         "command": command,
+        "object_name": object_name,
+        "object_id": object_id,
+        "position": position,
     }
-    if target_id is not None:
-        action["target_id"] = target_id
-
-    return action
 
 
 async def collect_unity_context_if_needed(websocket: WebSocket, command_data: dict) -> dict | None:
-    steps = ensure_command_steps(command_data)
-    if steps:
-        step_contexts = []
+    actions = ensure_command_actions(command_data)
+    if actions:
+        action_contexts = []
 
-        for step_index, step in enumerate(steps):
-            action = normalize_action(step.get("action"))
-            target = get_step_target(step)
-            if action == "put_item":
+        for action_index, action_data in enumerate(actions):
+            command = normalize_queue_command(action_data.get("command"))
+            target = get_action_target(action_data)
+            if command == "PUT_ITEM":
                 continue
-            if action not in {"move", "fetch", "get_item"} or not target:
+            if command not in {"MOVE_TO", "GET_ITEM"} or not target:
                 continue
 
             context = await request_unity_function(
@@ -304,145 +223,96 @@ async def collect_unity_context_if_needed(websocket: WebSocket, command_data: di
                 function_name="find_object",
                 args={
                     "query": target,
-                    "object_type": "location" if action == "move" else "item",
-                    "max_results": 100 if action in {"fetch", "get_item"} else 5,
+                    "object_type": "location" if command == "MOVE_TO" else "item",
+                    "max_results": 100 if command == "GET_ITEM" else 5,
                 },
             )
 
-            step_contexts.append(
+            action_contexts.append(
                 {
-                    "step_index": step_index,
-                    "action": action,
+                    "action_index": action_index,
+                    "command": command,
                     "target": target,
                     "context": context,
                 }
             )
 
-        command_data["steps"] = steps
-        return {"steps": step_contexts} if step_contexts else None
-
-    action = normalize_action(command_data.get("action"))
-    item = first_non_empty(command_data.get("object_name"), command_data.get("item"))
-    destination = first_non_empty(command_data.get("object_name"), command_data.get("destination"))
-
-    if action in {"fetch", "get_item"} and item:
-        return await request_unity_function(
-            websocket=websocket,
-            function_name="find_object",
-            args={
-                "query": item,
-                "object_type": "item",
-                "max_results": 5,
-            },
-        )
-
-    if action == "move" and destination:
-        return await request_unity_function(
-            websocket=websocket,
-            function_name="find_object",
-            args={
-                "query": destination,
-                "object_type": "location",
-                "max_results": 5,
-            },
-        )
+        command_data["actions"] = actions
+        return {"actions": action_contexts} if action_contexts else None
 
     return None
 
 
-def ensure_command_steps(command_data: dict) -> list[dict]:
-    raw_steps = command_data.get("steps")
-    if isinstance(raw_steps, list) and raw_steps:
-        return expand_counted_steps([step for step in raw_steps if isinstance(step, dict)])
+def ensure_command_actions(command_data: dict) -> list[dict]:
+    raw_actions = command_data.get("actions")
+    if not isinstance(raw_actions, list):
+        return []
 
-    action = normalize_action(command_data.get("action"))
-    target = get_command_target_name(command_data)
-    if action in {"move", "fetch", "get_item", "put_item"} and target:
-        return [
-            {
-                "action": action,
-                "target": target,
-                "object": get_command_object_id(command_data),
-                "object_name": target,
-                "object_id": get_command_object_id(command_data),
-                "position": command_data.get("position"),
-                "count": None,
-            }
-        ]
-
-    if action == "stop":
-        return [
-            {
-                "action": action,
-                "target": None,
-                "object": None,
-                "object_name": None,
-                "object_id": None,
-                "position": None,
-                "count": None,
-            }
-        ]
-
-    return []
-
-
-def expand_counted_steps(steps: list[dict]) -> list[dict]:
-    expanded_steps = []
-
-    for step in steps:
-        action = normalize_action(step.get("action"))
-        repeat_count = get_step_count(step) if action in {"fetch", "get_item", "put_item"} else 1
-
-        for _ in range(repeat_count):
-            expanded_step = dict(step)
-            if repeat_count > 1:
-                expanded_step["count"] = 1
-            expanded_steps.append(expanded_step)
-
-    return expanded_steps
-
-
-def get_step_count(step: dict) -> int:
-    count = step.get("count")
-    if isinstance(count, int) and count > 0:
-        return min(count, 100)
-
-    return 1
-
-
-def steps_need_object_resolution(command_data: dict) -> bool:
-    for step in ensure_command_steps(command_data):
-        action = normalize_action(step.get("action"))
-        if action == "put_item":
+    actions = []
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict):
             continue
-        if action in {"move", "fetch", "get_item"} and get_step_target(step) and not get_step_object_id(step):
+
+        command = normalize_action_command(raw_action.get("command"))
+        if command == "FETCH":
+            object_name = get_action_target(raw_action)
+            object_id = get_action_object_id(raw_action)
+            position = raw_action.get("position") if isinstance(raw_action.get("position"), dict) else None
+            actions.append(build_action("MOVE_TO", object_name, object_id, position, len(actions) + 1))
+            actions.append(build_action("GET_ITEM", object_name, object_id, position, len(actions) + 1))
+            continue
+        if not command:
+            continue
+
+        object_name = get_action_target(raw_action)
+        object_id = get_action_object_id(raw_action)
+        position = raw_action.get("position") if isinstance(raw_action.get("position"), dict) else None
+        actions.append(build_action(command, object_name, object_id, position, len(actions) + 1))
+
+    return actions
+
+
+def actions_need_object_resolution(command_data: dict) -> bool:
+    for action_data in ensure_command_actions(command_data):
+        command = normalize_queue_command(action_data.get("command"))
+        if command == "PUT_ITEM":
+            continue
+        if command in {"MOVE_TO", "GET_ITEM"} and get_action_target(action_data) and not get_action_object_id(action_data):
             return True
 
     return False
 
 
-def get_step_target(step: dict) -> str | None:
-    return first_non_empty(step.get("object_name"), step.get("target"), step.get("item"), step.get("destination"))
+def get_action_target(action_data: dict) -> str | None:
+    return first_non_empty(action_data.get("object_name"))
 
 
-def get_step_object_id(step: dict) -> str | None:
-    return first_non_empty(step.get("object_id"), step.get("object"))
+def get_action_object_id(action_data: dict) -> str | None:
+    return first_non_empty(action_data.get("object_id"))
 
 
-def get_command_target_name(command_data: dict) -> str | None:
-    return first_non_empty(command_data.get("object_name"), command_data.get("item"), command_data.get("destination"))
+def normalize_action_command(command: object) -> str | None:
+    normalized = normalize_queue_command(command)
+    if normalized in {"MOVE", "MOVE_TO"}:
+        return "MOVE_TO"
+    if normalized in {"FETCH", "BRING", "RETRIEVE"}:
+        return "FETCH"
+    if normalized in {"GET_ITEM", "GET", "PICK_UP", "PICKUP", "COLLECT", "TAKE"}:
+        return "GET_ITEM"
+    if normalized in {"PUT_ITEM", "PUT_DOWN", "DROP", "PLACE"}:
+        return "PUT_ITEM"
+    if normalized == "STOP":
+        return "STOP"
+
+    return None
 
 
-def get_command_object_id(command_data: dict) -> str | None:
-    return first_non_empty(command_data.get("object_id"), command_data.get("object"))
-
-
-def normalize_action(action: object) -> str | None:
-    if not isinstance(action, str):
+def normalize_queue_command(command: object) -> str | None:
+    if not isinstance(command, str):
         return None
 
-    normalized = action.strip().lower()
-    if normalized in {"", "null", "none", "no_action"}:
+    normalized = command.strip().upper()
+    if normalized in {"", "NULL", "NONE", "NO_ACTION"}:
         return None
 
     return normalized

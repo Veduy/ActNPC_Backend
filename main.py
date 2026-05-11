@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
 
 from paring_tools import parse_command
-from unity_tools import load_unity_capabilities
+from planner_agent import plan_command
+from unity_tools import UnityToolSession, load_unity_capabilities
 
 load_dotenv()
 
@@ -112,7 +113,7 @@ async def websocket_agent(websocket: WebSocket):
         while True:
             user_message = await websocket.receive_text()
             try:
-                input_route, command_data = await handle_user_input(user_message)
+                input_route, command_data = await handle_websocket_user_input(websocket, user_message)
             except HTTPException as exc:
                 await websocket.send_json(
                     {
@@ -139,6 +140,20 @@ async def websocket_agent(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("Unity client disconnected")
+
+
+async def handle_websocket_user_input(websocket: WebSocket, message: str) -> tuple[dict, dict]:
+    input_route = await route_input(message)
+    selected_route = input_route.get("route")
+
+    if selected_route == "dialogue":
+        return input_route, await build_dialogue_command(message)
+    if selected_route == "command":
+        initial_command = await parse_command(message)
+        planned_command = await plan_command(UnityToolSession(websocket), message, initial_command)
+        return input_route, planned_command
+
+    return input_route, build_noop_command("입력 의도를 분류하지 못했어요.")
 
 
 # 1차로 LLM이 사용자 입력 의도를 분류

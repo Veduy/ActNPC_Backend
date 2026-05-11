@@ -25,17 +25,17 @@ class CommandAction(TypedDict):
     object_name: Annotated[
         str | None,
         ...,
-        "Target object or place name in English. Use null if the action has no named target.",
+        "Human-readable target object or place name in English. Use only names allowed by the object database. Use null if the action has no named target.",
     ]
     object_id: Annotated[
         str | None,
         ...,
-        "Resolved Unity object id for this action. Use null until Unity resolves a concrete object id.",
+        "Unique Unity scene object instance id for the selected target. This must identify one concrete object in the current scene. Use null until a specific scene instance is selected.",
     ]
     position: Annotated[
         Vector3Dict | None,
         ...,
-        "Target world position for coordinate movement. Use null when moving to a named object.",
+        "Target world position for coordinate movement. Use null when moving to or acting on a selected scene object.",
     ]
 
 

@@ -11,7 +11,8 @@ Rules:
 - Compound commands become ordered actions;
 - Explicit repeated item counts should repeat the needed actions. No count => one action sequence.
 - For all/every item requests, keep the requested item target concise and do not guess object count.
-- Put named targets in action.object_name. Put resolved ids in action.object_id only after Unity resolves them; otherwise object_id=null.
+- Put named targets in action.object_name. Use only object names listed in the object database.
+- action.object_id is a unique Unity scene object instance id, not an object type id. Put resolved scene instance ids in action.object_id only after a concrete scene object is selected; otherwise object_id=null.
 - Put coordinate movement targets in position as {x,y,z}. Do not put object names in position.
 - object_name should be only the concise English object/place name.
 - action_id may be null; the backend will assign stable ids.

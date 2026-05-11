@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from langchain.chat_models import init_chat_model
 
 from command_schema import CommandDict
-from unity_tools import load_unity_capabilities_text
+from unity_tools import load_object_database_text, load_unity_capabilities_text
 
 
 load_dotenv()
@@ -33,6 +33,10 @@ def build_system_prompt() -> str:
         "Unity capabilities manifest:\n"
         "```json\n"
         f"{load_unity_capabilities_text()}\n"
+        "```\n\n"
+        "Object database. Use only these object names in action.object_name. The database describes allowed object names and aliases, not scene instance ids:\n"
+        "```json\n"
+        f"{load_object_database_text()}\n"
         "```"
     )
 

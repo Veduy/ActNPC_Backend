@@ -9,29 +9,18 @@ from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
 
-from paring_tools import (
-    extract_structured_output,
-    normalize_to_minimal_command,
-    parse_command,
-    replan_after_action_failure,
-)
+from paring_tools import parse_command
 from unity_tools import (
-    apply_resolved_object_ids,
-    collect_unity_context_if_needed,
-    finalize_unity_command,
-    handle_action_result,
-    is_action_result,
     is_client_function_result,
     load_unity_capabilities,
     parse_json_text,
-    actions_need_object_resolution,
 )
 
 load_dotenv()
 
 # model setting
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-INPUT_ROUTER_MODEL_NAME = "gpt-4.1-nano"
+INPUT_ROUTER_MODEL_NAME = "gpt-4.1-mini"
 input_router_base_model = init_chat_model(INPUT_ROUTER_MODEL_NAME)
 PROMPTS_DIR = Path(__file__).with_name("prompts")
 INPUT_ROUTER_PROMPT_PATH = PROMPTS_DIR / "input_router_system.md"
@@ -52,14 +41,7 @@ class UserInputRoute(TypedDict):
     reason: Annotated[str, ..., "Short English reason for the route."]
 
 
-class DialogueResponse(TypedDict):
-    """Non-executable NPC response for conversation input."""
-
-    message: Annotated[str, ..., "Natural Korean response for the user."]
-
-
-input_router_model = input_router_base_model.with_structured_output(UserInputRoute, include_raw=True)
-dialogue_model = input_router_base_model.with_structured_output(DialogueResponse, include_raw=True)
+input_router_model = input_router_base_model.with_structured_output(UserInputRoute)
 
 
 def load_prompt(path: Path) -> str:
@@ -125,25 +107,6 @@ async def command(
         "command": command_data,
     }
 
-@app.post("/command/test")
-async def command_test():
-    return {
-        "status": "ok",
-        "input": "사과로 이동해",
-        "command": {
-            "actions": [
-                {
-                    "action_id": "act_001",
-                    "command": "MOVE_TO",
-                    "object_name": "apple",
-                    "object_id": None,
-                    "position": None,
-                }
-            ],
-            "message": "사과 위치로 이동할게요.",
-        },
-    }
-
 
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
@@ -165,8 +128,16 @@ async def websocket_agent(websocket: WebSocket):
                     }
                 )
                 continue
-            if is_action_result(parsed_message):
-                await handle_action_result(websocket, parsed_message, replan_after_action_failure)
+            if parsed_message is not None and parsed_message.get("type") == "action_result":
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "code": "ACTION_RESULT_IGNORED",
+                            "message": "Action result handling is disabled in the simplified backend flow.",
+                        },
+                    }
+                )
                 continue
 
             user_message = raw_message
@@ -186,27 +157,6 @@ async def websocket_agent(websocket: WebSocket):
                 )
                 continue
 
-            if input_route.get("route") == "dialogue":
-                await websocket.send_json(
-                    {
-                        "type": "final_command",
-                        "status": "ok",
-                        "input": user_message,
-                        "input_route": input_route,
-                        "command": command_data,
-                        "client_context": None,
-                    }
-                )
-                continue
-
-            client_context = await collect_unity_context_if_needed(websocket, command_data)
-            apply_resolved_object_ids(command_data, client_context)
-            command_data = await normalize_to_minimal_command(user_message, command_data, client_context)
-            if actions_need_object_resolution(command_data):
-                normalized_context = await collect_unity_context_if_needed(websocket, command_data)
-                apply_resolved_object_ids(command_data, normalized_context)
-            finalize_unity_command(command_data)
-
             await websocket.send_json(
                 {
                     "type": "final_command",
@@ -214,7 +164,6 @@ async def websocket_agent(websocket: WebSocket):
                     "input": user_message,
                     "input_route": input_route,
                     "command": command_data,
-                    "client_context": client_context,
                 }
             )
 
@@ -248,7 +197,7 @@ async def route_input(message: str) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI input router invoke failed: {exc}") from exc
 
-    route = extract_structured_output(result, "route_input", INPUT_ROUTER_MODEL_NAME)
+    route = dict(result)
     if route.get("route") not in {
         "dialogue",
         "command",
@@ -267,7 +216,7 @@ async def build_dialogue_command(
     )
 
     try:
-        result = await dialogue_model.ainvoke(
+        result = await input_router_base_model.ainvoke(
             [
                 ("system", system_prompt),
                 ("human", message),
@@ -276,8 +225,7 @@ async def build_dialogue_command(
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"OpenAI dialogue invoke failed: {exc}") from exc
 
-    response = extract_structured_output(result, "build_dialogue_command", INPUT_ROUTER_MODEL_NAME)
-    return build_noop_command(response.get("message"))
+    return build_noop_command(getattr(result, "content", None))
 
 
 def build_noop_command(message: object) -> dict:

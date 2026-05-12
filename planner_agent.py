@@ -46,7 +46,7 @@ def build_planner_prompt() -> str:
 def build_planner_tools(tool_session: UnityToolSession):
     @tool
     async def find_scene_objects(query: str, object_type: str | None = None, max_results: int = 5) -> dict:
-        """Find Unity scene object instances by object name or alias."""
+        """Find Unity scene object instances by object name or alias. Returns object_id, object_name, type, position, active, and distance from the NPC."""
         return await tool_session.request(
             "find_scene_objects",
             {
@@ -63,7 +63,7 @@ def build_planner_tools(tool_session: UnityToolSession):
 
     @tool
     async def get_inventory() -> dict:
-        """Return the NPC inventory items."""
+        """Return the list of items currently held by the NPC."""
         return await tool_session.request("get_inventory", {})
 
     return [find_scene_objects, get_agent_state, get_inventory]

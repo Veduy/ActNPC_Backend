@@ -34,7 +34,7 @@
     {
       "intent_action": "put_item",
       "unity_command": "PUT_ITEM",
-      "description": "Put down one inventory item into the world near the NPC.",
+      "description": "Put down one inventory item into the world",
       "target_type": "inventory_item",
       "target_required": true,
       "examples": ["put down the apple", "drop the box", "place the apple on the ground"]

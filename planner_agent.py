@@ -20,7 +20,6 @@ def build_planner_prompt() -> str:
         "Use Unity tools to inspect scene objects, agent state, and inventory before choosing object_id values.\n"
         "Conversation memory may contain summary, recent messages, and the last command. "
         "Use it only to resolve references to previous items, places, targets, or commands.\n"
-        "Do not invent Unity commands. Use only MOVE_TO, GET_ITEM, PUT_ITEM, STOP, or null.\n\n"
 
         "Output rules:\n"
         "- Return actions only; do not use top-level action/object_name/object_id/position fields.\n"
@@ -31,19 +30,14 @@ def build_planner_prompt() -> str:
         "- action_id may be null; the backend will assign stable ids.\n\n"
 
         "Command parsing rules:\n"
-        "- Map pickup/grab/collect/take/fetch/retrieve/get-for-user to GET_ITEM.\n"
-        "- Map put down/drop/place/take out from inventory to PUT_ITEM.\n"
-        "- Map go/move/approach/head to MOVE_TO.\n"
         "- MOVE_TO requires a known scene object, place name, or explicit world coordinates.\n"
         "- Put coordinate movement targets in position as {x,y,z}. Do not put object names in position.\n"
-        "- Relative movement such as forward/back/left/right is unsupported; return actions empty and explain the limitation.\n"
         "- Unsupported physical actions: return actions empty and explain the unavailable capability.\n"
         "- Compound commands become ordered actions.\n"
         "- Explicit repeated item counts should repeat the needed actions. No count means one action sequence.\n"
         "- For all/every item requests, keep the requested item target concise and do not guess object count.\n\n"
 
         "Planning rules:\n"
-        "- Before every GET_ITEM, include MOVE_TO for the same item unless tool results show the NPC is already near it.\n"
         "- PUT_ITEM requires the item to be in inventory.\n"
         "- If the item is not in inventory and the user requested putting that item somewhere, first plan MOVE_TO item then GET_ITEM item.\n"
         "- If putting an item at, near, in front of, or into a place/object, include MOVE_TO for that place/object before PUT_ITEM.\n"

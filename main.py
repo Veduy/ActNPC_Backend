@@ -1,7 +1,6 @@
-﻿from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 
 import os
-import json
 from pathlib import Path
 from typing import Literal
 from fastapi import Request
@@ -14,7 +13,7 @@ from typing_extensions import Annotated, TypedDict
 from debug_events import TOOL_EVENT_HUB, format_sse
 from paring_tools import parse_command
 from planner_agent import plan_command
-from unity_tools import UnityToolSession, load_unity_capabilities
+from unity_tools import UnityToolSession
 
 load_dotenv()
 
@@ -65,30 +64,6 @@ def health_check():
         "service": "actnpc-backend",
         "version": "0.1.0",
     }
-
-
-@app.get("/health/openai")
-async def openai_health_check(
-    message: str = Query(..., min_length=1, description="Natural language input for the connected model"),
-):
-    input_route, command = await handle_user_input(message)
-
-    return {
-        "status": "ok",
-        "input": message,
-        "input_route": input_route,
-        "command": command,
-    }
-
-
-@app.get("/unity/capabilities")
-def unity_capabilities():
-    try:
-        return load_unity_capabilities()
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail="unity_capabilities.json was not found.") from exc
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"unity_capabilities.json is invalid JSON: {exc}") from exc
 
 
 @app.get("/debug/tool-events")
@@ -296,23 +271,6 @@ def debug_tool_events_view():
 """
 
 
-@app.post("/command")
-async def command(
-    message: Annotated[
-        str,
-        Body(..., embed=True, min_length=1, description="Natural language command from Unity."),
-    ],
-):
-    input_route, command_data = await handle_user_input(message)
-
-    return {
-        "status": "ok",
-        "input": message,
-        "input_route": input_route,
-        "command": command_data,
-    }
-
-
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
     await websocket.accept()
@@ -360,21 +318,6 @@ async def handle_websocket_user_input(websocket: WebSocket, message: str) -> tup
         initial_command = await parse_command(message)
         planned_command = await plan_command(UnityToolSession(websocket), message, initial_command)
         return input_route, planned_command
-
-    return input_route, build_noop_command("입력 의도를 분류하지 못했어요.")
-
-
-# 1차로 LLM이 사용자 입력 의도를 분류
-async def handle_user_input(message: str) -> tuple[dict, dict]:
-    input_route = await route_input(message)
-    selected_route = input_route.get("route")
-
-    if selected_route == "dialogue":
-        return input_route, await build_dialogue_command(
-            message,
-        )
-    if selected_route == "command":
-        return input_route, await parse_command(message)
 
     return input_route, build_noop_command("입력 의도를 분류하지 못했어요.")
 

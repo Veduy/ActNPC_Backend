@@ -18,11 +18,14 @@ def build_planner_prompt() -> str:
         "You receive the user's original natural language command.\n"
         "Return a final CommandDict that can execute successfully in the current Unity scene.\n"
         "Use Unity tools to inspect scene objects, agent state, and inventory before choosing object_id values.\n"
+        "Conversation memory may contain summary, recent messages, and the last command. "
+        "Use it only to resolve references to previous items, places, targets, or commands.\n"
         "Do not invent Unity commands. Use only MOVE_TO, GET_ITEM, PUT_ITEM, STOP, or null.\n\n"
 
         "Output rules:\n"
         "- Return actions only; do not use top-level action/object_name/object_id/position fields.\n"
         "- English for command, object_name, object_id, and action fields. Korean for message.\n"
+        "- The Korean message must use casual speech, not honorifics, and every Korean sentence must end with 냥.\n"
         "- Use only object names from the object database in action.object_name.\n"
         "- action.object_id may be used only when it comes from a Unity tool result and identifies one concrete scene or inventory instance.\n"
         "- action_id may be null; the backend will assign stable ids.\n\n"
@@ -98,9 +101,11 @@ def build_planner_agent(tool_session: UnityToolSession):
 async def plan_command(
     tool_session: UnityToolSession,
     user_message: str,
+    memory_context: dict | None = None,
 ) -> dict:
     planner_input = {
         "user_message": user_message,
+        "memory": memory_context or {},
     }
 
     try:
@@ -151,6 +156,10 @@ def normalize_command(command: dict) -> dict:
             action.setdefault("position", None)
 
     message = command.get("message")
+    if not isinstance(message, str) or not message.strip():
+        command["message"] = "명령을 처리했어요."
+        return command
+    return command
     if not isinstance(message, str) or not message.strip():
         command["message"] = "명령을 처리했어요."
 

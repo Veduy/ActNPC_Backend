@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException
 
+import json
 import os
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 from fastapi import Request
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -11,6 +13,7 @@ from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
 
 from debug_events import TOOL_EVENT_HUB, format_sse
+from memory_store import MEMORY_STORE, SessionMemory
 from planner_agent import plan_command
 from unity_tools import UnityToolSession
 
@@ -273,12 +276,15 @@ def debug_tool_events_view():
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
     await websocket.accept()
+    session_id = f"session_{uuid4().hex}"
+    memory = MEMORY_STORE.get_or_create(session_id)
 
     try:
         while True:
             user_message = await websocket.receive_text()
+            memory.append_message("user", user_message)
             try:
-                input_route, command_data = await handle_websocket_user_input(websocket, user_message)
+                input_route, command_data = await handle_websocket_user_input(websocket, user_message, memory)
             except HTTPException as exc:
                 await websocket.send_json(
                     {
@@ -291,6 +297,7 @@ async def websocket_agent(websocket: WebSocket):
                         },
                     }
                 )
+                await memory.summarize_if_needed(summarize_memory)
                 continue
 
             await websocket.send_json(
@@ -302,23 +309,27 @@ async def websocket_agent(websocket: WebSocket):
                     "command": command_data,
                 }
             )
+            memory.append_message("assistant", command_data.get("message", ""))
+            memory.remember_command(command_data)
+            await memory.summarize_if_needed(summarize_memory)
 
     except WebSocketDisconnect:
         print("Unity client disconnected")
+    finally:
+        MEMORY_STORE.delete(session_id)
 
 
-async def handle_websocket_user_input(websocket: WebSocket, message: str) -> tuple[dict, dict]:
+async def handle_websocket_user_input(websocket: WebSocket, message: str, memory: SessionMemory) -> tuple[dict, dict]:
     input_route = await route_input(message)
     selected_route = input_route.get("route")
 
     if selected_route == "dialogue":
-        return input_route, await build_dialogue_command(message)
+        return input_route, await build_dialogue_command(message, memory.build_dialogue_context())
     if selected_route == "command":
-        planned_command = await plan_command(UnityToolSession(websocket), message)
+        planned_command = await plan_command(UnityToolSession(websocket), message, memory.build_planner_context())
         return input_route, planned_command
 
-    return input_route, build_noop_command("입력 의도를 분류하지 못했어요.")
-
+    return input_route, build_noop_command("\uc785\ub825 \uc758\ub3c4\ub97c \ubd84\ub958\ud558\uc9c0 \ubabb\ud588\uc5b4\uc694.")
 
 async def route_input(message: str) -> dict:
     try:
@@ -343,17 +354,25 @@ async def route_input(message: str) -> dict:
 
 async def build_dialogue_command(
     message: str,
+    memory_context: dict,
 ) -> dict:
     system_prompt = (
         "You are a friendly Unity NPC. Answer questions and small talk in Korean. "
-        "Do not claim that you performed any physical action."
+        "Use the conversation memory only to maintain continuity. "
+        "Do not claim that you performed any physical action. "
+        "Use casual Korean speech, not honorifics. "
+        "End every Korean sentence with 냥."
     )
+    user_payload = {
+        "memory": memory_context,
+        "user_message": message,
+    }
 
     try:
         result = await input_router_base_model.ainvoke(
             [
                 ("system", system_prompt),
-                ("human", message),
+                ("human", json.dumps(user_payload, ensure_ascii=False)),
             ]
         )
     except Exception as exc:
@@ -362,13 +381,44 @@ async def build_dialogue_command(
     return build_noop_command(getattr(result, "content", None))
 
 
-def build_noop_command(message: object) -> dict:
-    return {
-        "actions": [],
-        "message": message if isinstance(message, str) and message.strip() else "지금은 실행할 명령이 없어요.",
+async def summarize_memory(existing_summary: str, messages: list[dict[str, str]]) -> str:
+    system_prompt = (
+        "Summarize Unity NPC conversation memory in Korean. "
+        "Keep stable facts, user preferences, unresolved references, and recent task context. "
+        "Be concise and do not invent details."
+    )
+    user_payload = {
+        "existing_summary": existing_summary,
+        "messages_to_merge": messages,
     }
 
+    try:
+        result = await input_router_base_model.ainvoke(
+            [
+                ("system", system_prompt),
+                ("human", json.dumps(user_payload, ensure_ascii=False)),
+            ]
+        )
+    except Exception as exc:
+        print(f"OpenAI memory summary invoke failed: {exc}")
+        return existing_summary
 
+    content = getattr(result, "content", "")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+
+    return existing_summary
+
+
+def build_noop_command(message: object) -> dict:
+    use_default_message = not isinstance(message, str) or not message.strip()
+    if not isinstance(message, str) or not message.strip():
+        message = "지금은 실행할 명령이 없어요."
+
+    return {
+        "actions": [],
+        "message": "\uc9c0\uae08\uc740 \uc2e4\ud589\ud560 \uba85\ub839\uc774 \uc5c6\uc5b4\uc694." if use_default_message else message,
+    }
 def main():
     import uvicorn
 

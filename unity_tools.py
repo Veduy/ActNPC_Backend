@@ -1,9 +1,12 @@
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 
 from fastapi import WebSocket
+
+from debug_events import TOOL_EVENT_HUB
 
 
 CAPABILITIES_PATH = Path(__file__).with_name("unity_capabilities.json")
@@ -19,6 +22,15 @@ class UnityToolSession:
     async def request(self, function_name: str, args: dict) -> dict:
         async with self.request_lock:
             call_id = f"call_{uuid.uuid4().hex}"
+            started_at = time.perf_counter()
+            await TOOL_EVENT_HUB.publish(
+                "tool_call",
+                {
+                    "call_id": call_id,
+                    "function": function_name,
+                    "args": args,
+                },
+            )
 
             await self.websocket.send_json(
                 {
@@ -32,15 +44,34 @@ class UnityToolSession:
             response = await self._receive_matching_response(call_id)
             result = response.get("result")
             if isinstance(result, dict):
+                await TOOL_EVENT_HUB.publish(
+                    "tool_result",
+                    {
+                        "call_id": call_id,
+                        "function": function_name,
+                        "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                        "result": result,
+                    },
+                )
                 return result
 
-            return {
+            error_result = {
                 "ok": False,
                 "error": {
                     "code": "INVALID_CLIENT_FUNCTION_RESULT",
                     "message": f"Unity returned no result for {function_name}.",
                 },
             }
+            await TOOL_EVENT_HUB.publish(
+                "tool_result",
+                {
+                    "call_id": call_id,
+                    "function": function_name,
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "result": error_result,
+                },
+            )
+            return error_result
 
     async def _receive_matching_response(self, call_id: str) -> dict:
         deadline = asyncio.get_running_loop().time() + self.timeout_seconds

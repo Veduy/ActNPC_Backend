@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from typing_extensions import Annotated, TypedDict
 
 from debug_events import TOOL_EVENT_HUB, format_sse
-from paring_tools import parse_command
 from planner_agent import plan_command
 from unity_tools import UnityToolSession
 
@@ -315,8 +314,7 @@ async def handle_websocket_user_input(websocket: WebSocket, message: str) -> tup
     if selected_route == "dialogue":
         return input_route, await build_dialogue_command(message)
     if selected_route == "command":
-        initial_command = await parse_command(message)
-        planned_command = await plan_command(UnityToolSession(websocket), message, initial_command)
+        planned_command = await plan_command(UnityToolSession(websocket), message)
         return input_route, planned_command
 
     return input_route, build_noop_command("입력 의도를 분류하지 못했어요.")

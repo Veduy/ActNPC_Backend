@@ -1,96 +1,129 @@
 # ActNPC - 자연어 기반 Unity NPC 제어 시스템
 
-플레이어의 자연어 입력을 LLM이 해석하고, Unity NPC가 실제 게임 액션으로 실행하는 AI NPC 제어 프로토타입입니다.
+ActNPC는 플레이어의 자연어 입력을 LLM이 Unity 실행 명령으로 변환하고, Unity NPC가 해당 명령을 실제 게임 월드 액션으로 실행하는 프로토타입입니다. 백엔드는 자연어 해석, 명령 계획, Unity 상태 조회 요청을 담당하고, Unity 클라이언트는 상태 조회 응답과 최종 액션 실행을 담당합니다.
 
-## 프로젝트 개요
-
-ActNPC는 Unity와 FastAPI 백엔드를 WebSocket으로 연결해, 플레이어가 입력한 자연어 명령을 LLM이 해석하고 NPC가 실제 게임 월드에서 실행 가능한 액션으로 변환하는 프로토타입입니다.
-
-플레이어는 정해진 명령어를 외우지 않고 "사과 가져와", "상자로 가", "그거 내려놔"처럼 자연스러운 문장으로 NPC에게 지시할 수 있습니다. 백엔드는 입력 의도를 분석하고, Unity 씬 상태를 조회한 뒤, NPC가 처리할 수 있는 구조화된 명령 시퀀스를 생성합니다. Unity 클라이언트는 이 명령을 받아 이동, 아이템 획득, 아이템 내려놓기, 정지 같은 실제 행동으로 실행합니다.
-
-### Unity Project
+## Unity Project
 
 - [ActNPC Unity Project](https://github.com/Veduy/ActNPC.git)
 
-## 개발 동기
+## Core Idea
 
-일반적인 NPC 상호작용은 대화 선택지, 고정된 명령어, 하드코딩된 트리거에 의존하는 경우가 많습니다. 이 방식은 구현은 명확하지만, 플레이어가 시스템이 허용하는 입력 방식에 맞춰 행동해야 한다는 한계가 있습니다.
+- 자연어 입력을 바로 실행하지 않고, 먼저 대화와 실행 명령으로 분류합니다.
+- 실행 명령은 LLM이 정해진 JSON 명령 스키마로 변환합니다.
+- LLM이 임의로 대상을 추측하지 않도록 Unity 상태 조회 결과와 허용 오브젝트 목록을 사용합니다.
+- Unity는 백엔드가 보낸 최종 명령만 받아 NPC 액션 큐에서 순차 실행합니다.
 
-이 프로젝트는 반대로 플레이어가 자연어로 의도를 전달하고, 시스템이 그 의도를 게임 내 실행 가능한 행동으로 바꾸는 흐름을 실험하기 위해 만들었습니다. 단순히 NPC가 대답만 하는 구조가 아니라, LLM이 Unity 씬 상태와 인벤토리를 조회한 뒤 실행 가능한 명령 시퀀스를 생성하도록 설계했습니다.
-
-## 주요 기능
-
-- 자연어 입력을 대화와 실행 명령으로 분류
-- LLM을 활용해 플레이어 의도를 구조화된 NPC 액션으로 변환
-- Unity 클라이언트와 FastAPI 백엔드 간 WebSocket 실시간 통신
-- 현재 씬 오브젝트, NPC 상태, 보유 아이템 정보를 백엔드에서 조회
-- `MOVE_TO`, `GET_ITEM`, `PUT_ITEM`, `STOP` 명령 실행
-- 복합 명령을 여러 액션으로 나누어 순차 실행
-- NPC 말풍선을 통한 대화 및 명령 결과 피드백
-- LLM tool call 과정을 확인할 수 있는 디버그 이벤트 뷰 제공
-
-## 시스템 아키텍처
+## Architecture
 
 ```text
-Player Input
-    -> Unity Input UI
-    -> WebSocket
-    -> FastAPI Backend
-    -> LLM Input Router
-    -> Command Planner
-    -> Unity State Tool Calls
-    -> Structured Command
-    -> Unity NPC Action Queue
-    -> NPC Movement / Item Action / Speech Bubble
+Unity Input
+  -> WebSocket
+  -> FastAPI
+  -> Input Router
+  -> Planner Agent
+  -> Unity Tool Call
+  -> Command JSON
+  -> NPC Action Queue
 ```
 
-전체 흐름은 자연어 입력 → 의도 분류 → Unity 상태 조회 → 구조화된 명령 생성 → NPC 액션 큐 실행으로 이어집니다.
+백엔드는 플레이어 입력을 받은 뒤 먼저 대화인지 명령인지 분류합니다. 명령으로 판단되면 LLM 플래너가 Unity에 필요한 상태 조회를 요청하고, 그 결과를 바탕으로 실행 가능한 명령 JSON을 생성합니다. Unity 클라이언트는 최종 명령을 받아 이동, 아이템 획득, 아이템 내려놓기, 정지 액션을 처리합니다.
 
-백엔드는 플레이어 입력을 받은 뒤 먼저 대화인지 실행 명령인지 분류합니다. 실행 명령으로 판단되면 LLM 기반 플래너가 Unity에 필요한 상태 조회를 요청합니다. Unity는 현재 NPC 위치, 주변 오브젝트, 보유 아이템 정보를 반환하고, 백엔드는 이 정보를 바탕으로 NPC가 실행할 수 있는 액션 목록을 생성합니다.
+## Command Flow
 
-Unity 클라이언트는 최종 명령을 받아 액션 큐에 등록하고 순서대로 실행합니다. 예를 들어 "사과 주워서 박스에 내려놔" 같은 입력은 이동, 획득, 이동, 내려놓기 액션으로 나뉘어 처리됩니다.
+1. Unity 입력창에서 플레이어가 자연어를 입력합니다.
+2. Unity 클라이언트가 WebSocket으로 백엔드에 입력을 전송합니다.
+3. 백엔드는 입력을 `dialogue` 또는 `command`로 라우팅합니다.
+4. `command`인 경우 LLM 기반 플래너를 실행합니다.
+5. 플래너는 필요한 경우 Unity 상태 조회 tool call을 요청합니다.
+6. Unity는 씬 오브젝트, NPC 상태, 보유 아이템 정보를 반환합니다.
+7. 백엔드는 최종 `final_command` 메시지를 Unity로 전송합니다.
+8. Unity NPC는 명령의 `actions`를 액션 큐에 넣고 순차 실행합니다.
 
-## 기술 스택
+## Command Schema
 
-- **Engine**: Unity
-- **Backend**: Python, FastAPI, WebSocket
-- **AI / LLM**: OpenAI API, LangChain, Structured Output, Tool Calling
-- **Data Format**: JSON command schema
+LLM 응답은 자유 텍스트가 아니라 Unity가 실행할 수 있는 구조화된 명령으로 제한합니다.
 
-## 핵심 구현 내용
+```json
+{
+  "actions": [
+    {
+      "command": "MOVE_TO",
+      "object_name": "apple",
+      "object_id": 1,
+      "position": {0,0,0}
+    },
+    {
+      "command": "GET_ITEM",
+      "object_name": "apple",
+      "object_id": 1,
+      "position": {0,0,0}
+    }
+  ],
+  "message": "사과 가지러 갈게냥."
+}
+```
 
-### FastAPI WebSocket 서버
+`actions`는 NPC가 순서대로 실행할 액션 목록입니다. `object_name`은 허용 오브젝트 목록에 있는 이름만 사용할 수 있고, `object_id`는 Unity 상태 조회 결과로 실제 씬 인스턴스가 선택된 경우에만 사용합니다.
 
-Unity 클라이언트와 백엔드가 지속적으로 메시지를 주고받을 수 있도록 WebSocket 기반 통신을 구현했습니다. 플레이어 입력, Unity 상태 조회 요청, 상태 조회 결과, 최종 명령 응답이 모두 같은 연결 안에서 처리됩니다.
+## Supported Actions
 
-### LLM 입력 라우팅
+| Command | Description |
+| --- | --- |
+| `MOVE_TO` | 대상 오브젝트 또는 좌표로 이동 |
+| `GET_ITEM` | 대상 아이템 획득 |
+| `PUT_ITEM` | 보유 중인 아이템을 월드에 내려놓기 |
+| `STOP` | 현재 실행 중이거나 대기 중인 액션 정지 |
 
-플레이어 입력을 먼저 대화와 실행 명령으로 분류합니다. 단순 대화는 NPC의 말풍선 응답으로 처리하고, 실제 행동이 필요한 문장은 명령 플래너로 전달합니다. 이를 통해 모든 입력을 무조건 액션으로 바꾸지 않고, NPC 대화와 행동 명령을 분리했습니다.
+## Example Commands
 
-### LangChain 기반 명령 플래너
+| Player Input | Generated Actions |
+| --- | --- |
+| `사과 가져와` | `MOVE_TO apple` -> `GET_ITEM apple` |
+| `상자로 가` | `MOVE_TO box` |
+| `사과 내려놔` | `PUT_ITEM apple` |
+| `멈춰` | `STOP` |
 
-LLM이 플레이어의 자연어 명령을 Unity에서 실행 가능한 액션 목록으로 변환하도록 구성했습니다. 명령 결과는 자유 텍스트가 아니라 정해진 JSON 구조로 반환되며, 각 액션은 명령 종류, 대상 오브젝트, 좌표, 응답 메시지를 포함할 수 있습니다.
+현재 `box`는 별도 장소 시스템이 아니라 허용 오브젝트 목록에 등록된 아이템 대상입니다. 따라서 `상자로 가`는 상자 오브젝트의 위치로 이동하는 예시입니다.
 
-### Unity 상태 조회용 Tool Call 구조
+## Backend Responsibilities
 
-LLM이 추측만으로 명령을 만들지 않도록, 백엔드에서 Unity 클라이언트에 현재 게임 상태를 조회할 수 있는 도구 호출 구조를 만들었습니다. 플래너는 필요한 경우 씬 오브젝트, NPC 위치, 보유 아이템 정보를 조회한 뒤 명령을 생성합니다.
+- FastAPI 기반 WebSocket 서버 제공
+- 플레이어 입력을 대화와 실행 명령으로 라우팅
+- LangChain 기반 LLM 플래너 실행
+- Unity 상태 조회 tool call 요청
+- 허용 오브젝트 목록과 실행 가능 capability manifest 제공
+- 최종 명령을 `final_command` 메시지로 Unity에 전달
+- LLM tool call 흐름을 확인할 수 있는 디버그 이벤트 스트리밍
 
-### 구조화된 명령 스키마
+## Unity Responsibilities
 
-NPC가 실행할 수 있는 명령을 `actions` 배열로 정의했습니다. 현재 지원하는 실행 명령은 이동, 아이템 획득, 아이템 내려놓기, 정지입니다. 지원하지 않는 행동은 임의로 생성하지 않고, 실행 가능한 기능이 없다는 메시지를 반환하도록 설계했습니다.
+- 입력 UI에서 자연어 명령을 받아 WebSocket으로 전송
+- 백엔드 메시지를 수신하고 타입별로 처리
+- Unity 상태 조회 요청에 씬 오브젝트, NPC 상태, 보유 아이템 정보로 응답
+- 최종 명령의 `actions`를 NPC 액션 큐로 실행
+- 이동, 아이템 획득, 아이템 배치, 정지 처리
+- NPC 말풍선으로 대화 또는 명령 결과 메시지 표시
 
-### NPC 액션 큐
+## Object Constraints
 
-Unity 측에서는 여러 액션을 큐에 넣고 순차적으로 실행하도록 구현했습니다. 이동이 끝난 뒤 아이템을 획득하거나, 특정 위치로 이동한 뒤 아이템을 내려놓는 식의 복합 명령을 처리할 수 있습니다.
+현재 `object_database.json` 기준으로 허용된 대상은 `apple`, `box`입니다. SystemPrompt에는 `action.object_name`에 object database 안의 이름만 사용하도록 명시되어 있어, LLM이 임의의 오브젝트를 대상으로 명령을 생성하지 않도록 제한합니다.
 
-### 허용 오브젝트 기반 대상 제한
 
-LLM이 임의의 오브젝트를 대상으로 명령을 생성하지 않도록, 백엔드에 허용 오브젝트 목록을 두고 SystemPrompt에 이 목록 안의 이름만 사용하도록 제한했습니다. 현재는 `apple`, `box`를 대상으로 정의하고, "사과", "빨간 사과", "박스", "상자" 같은 별칭은 해당 오브젝트로 해석되도록 구성했습니다.
+## WebSocket Message Types
 
-### NPC 아이템 보관 및 배치 처리
+| Type | Direction | Purpose |
+| --- | --- | --- |
+| `client_function_call` | Backend -> Unity | Unity 상태 조회 요청 |
+| `client_function_result` | Unity -> Backend | 상태 조회 결과 반환 |
+| `final_command` | Backend -> Unity | NPC가 실행할 최종 명령 전달 |
+| `error` | Backend -> Unity | 명령 처리 실패 전달 |
 
-NPC가 아이템을 획득하면 월드에서 비활성화하고 보유 상태로 관리합니다. 이후 내려놓기 명령을 받으면 NPC 앞 위치에 아이템을 다시 배치해, 자연어 명령이 실제 월드 상태 변화로 이어지도록 했습니다.
+## Debugging
 
-### SSE 디버그 이벤트 뷰
+LLM 플래너가 Unity에 어떤 상태 조회 요청을 보냈고 Unity가 어떤 결과를 반환했는지는 다음 디버그 뷰에서 확인할 수 있습니다.
 
-LLM 플래너가 Unity에 어떤 상태 조회 요청을 보냈고 어떤 결과를 받았는지 확인할 수 있는 디버그 이벤트 뷰를 구현했습니다. 이를 통해 자연어 명령이 어떤 과정을 거쳐 최종 액션으로 변환되는지 추적할 수 있습니다.
+```text
+/debug/tool-events/view
+```
+
+이 뷰는 tool call과 tool result를 시간순으로 보여주기 때문에, 자연어 입력이 최종 액션으로 변환되는 과정을 추적할 때 사용할 수 있습니다.

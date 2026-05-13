@@ -1,4 +1,4 @@
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import Annotated, NotRequired, TypedDict
 
 
 class Vector3Dict(TypedDict):
@@ -12,31 +12,27 @@ class Vector3Dict(TypedDict):
 class CommandAction(TypedDict):
     """One executable action for a Unity NPC command."""
 
-    action_id: Annotated[
+    action_id: NotRequired[Annotated[
         str | None,
-        ...,
         "Stable action id. Use null when the backend should assign one.",
-    ]
+    ]]
     command: Annotated[
         str | None,
         ...,
         "Executable Unity command. Use MOVE_TO, GET_ITEM, PUT_ITEM, STOP, or null.",
     ]
-    object_name: Annotated[
+    object_name: NotRequired[Annotated[
         str | None,
-        ...,
         "Human-readable target object or place name in English. Use only names allowed by the object database. Use null if the action has no named target.",
-    ]
-    object_id: Annotated[
+    ]]
+    object_id: NotRequired[Annotated[
         str | None,
-        ...,
         "Unique Unity scene object instance id for the selected target. This must identify one concrete object in the current scene. Use null until a specific scene instance is selected.",
-    ]
-    position: Annotated[
+    ]]
+    position: NotRequired[Annotated[
         Vector3Dict | None,
-        ...,
         "Target world position for coordinate movement. Use null when moving to or acting on a selected scene object.",
-    ]
+    ]]
 
 
 class CommandDict(TypedDict):

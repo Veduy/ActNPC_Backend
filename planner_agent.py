@@ -3,6 +3,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import tool
 
 from command_schema import CommandDict
@@ -22,6 +23,8 @@ def build_planner_prompt() -> str:
         "Use it only to resolve references to previous items, places, targets, or commands.\n"
 
         "Output rules:\n"
+        "- Return exactly one CommandDict structured response.\n"
+        "- Do not output Markdown, explanations, or multiple JSON objects.\n"
         "- Return actions only; do not use top-level action/object_name/object_id/position fields.\n"
         "- English for command, object_name, object_id, and action fields. Korean for message.\n"
         "- The Korean message must use casual speech, not honorifics, and every Korean sentence must end with 냥.\n"
@@ -88,7 +91,7 @@ def build_planner_agent(tool_session: UnityToolSession):
         model=PLANNER_MODEL,
         tools=build_planner_tools(tool_session),
         system_prompt=build_planner_prompt(),
-        response_format=CommandDict,
+        response_format=ToolStrategy(CommandDict),
     )
 
 
@@ -150,10 +153,6 @@ def normalize_command(command: dict) -> dict:
             action.setdefault("position", None)
 
     message = command.get("message")
-    if not isinstance(message, str) or not message.strip():
-        command["message"] = "명령을 처리했어요."
-        return command
-    return command
     if not isinstance(message, str) or not message.strip():
         command["message"] = "명령을 처리했어요."
 
